@@ -507,6 +507,15 @@ public:
       return m_iteration_count;
   }
 
+  bool IsTID(lldb::tid_t tid) { return tid == m_tid; }
+  bool HasTID() { return m_tid != LLDB_INVALID_THREAD_ID; }
+  void ClearTID() { m_tid = LLDB_INVALID_THREAD_ID; }
+  lldb::tid_t GetTID() { return m_tid; }
+  void SetTID(lldb::tid_t tid) { m_tid = tid; }
+
+  friend lldb::ThreadPlanSP
+  Process::FindDetachedPlanExplainingStop(Event *event_ptr);
+
 protected:
   // Classes that inherit from ThreadPlan can see and modify these
 

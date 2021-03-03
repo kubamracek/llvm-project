@@ -95,6 +95,9 @@ public:
 
   void WillResume();
 
+  bool IsTID(lldb::tid_t tid);
+  lldb::tid_t GetTID();
+
 private:
   const PlanStack &GetStackOfKind(ThreadPlanStack::StackKind kind) const;
 
@@ -145,8 +148,32 @@ public:
       return &result->second;
   }
 
+  // rename to Reactivate?
+  void Activate(ThreadPlanStack &&stack) {
+    auto inserted = m_plans_list.emplace(stack.GetTID(), std::move(stack));
+    assert(inserted.second && "stack not activated");
+  }
+
+  std::vector<ThreadPlanStack> CleanUp() {
+    std::vector<lldb::tid_t> invalidated_tids;
+    for (auto &pair : m_plans_list) {
+      if (!pair.second.IsTID(pair.first)) {
+        invalidated_tids.push_back(pair.first);
+      }
+    }
+
+    std::vector<ThreadPlanStack> detached_stacks;
+    for (auto tid : invalidated_tids) {
+      auto it = m_plans_list.find(tid);
+      auto stack = std::move(it->second);
+      m_plans_list.erase(it);
+      detached_stacks.emplace_back(std::move(stack));
+    }
+    return detached_stacks;
+  }
+
   void Clear() {
-    for (auto plan : m_plans_list)
+    for (auto &plan : m_plans_list)
       plan.second.ThreadDestroyed(nullptr);
     m_plans_list.clear();
   }

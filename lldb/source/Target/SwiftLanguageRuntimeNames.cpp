@@ -13,9 +13,7 @@
 #include "SwiftLanguageRuntimeImpl.h"
 #include "lldb/Target/SwiftLanguageRuntime.h"
 
-#include "swift/ABI/Task.h"
-#include "swift/Demangling/Demangle.h"
-#include "swift/Demangling/Demangler.h"
+#include "lldb/Breakpoint/StoppointCallbackContext.h"
 #include "lldb/Symbol/Block.h"
 #include "lldb/Symbol/CompileUnit.h"
 #include "lldb/Symbol/VariableList.h"
@@ -24,6 +22,12 @@
 #include "lldb/Target/ThreadPlanStepInRange.h"
 #include "lldb/Target/ThreadPlanStepOverRange.h"
 #include "lldb/Utility/Log.h"
+#include "swift/ABI/Task.h"
+#include "swift/Demangling/Demangle.h"
+#include "swift/Demangling/Demangler.h"
+
+#include "Plugins/Process/Utility/RegisterContext_x86.h"
+#include "Utility/ARM64_DWARF_Registers.h"
 
 using namespace lldb;
 using namespace lldb_private;
@@ -194,7 +198,7 @@ public:
     auto fn_start = sc.symbol->GetFileAddress();
     auto fn_end = sc.symbol->GetFileAddress() + sc.symbol->GetByteSize();
     int line_entry_count = 0;
-    if (auto line_table = sc.comp_unit->GetLineTable()) {
+    if (auto *line_table = sc.comp_unit->GetLineTable()) {
       for (uint32_t i = 0; i < line_table->GetSize(); ++i) {
         LineEntry line_entry;
         if (line_table->GetLineEntryAtIndex(i, line_entry)) {
@@ -220,8 +224,6 @@ public:
   ThreadPlanStepInAsync(Thread &thread, SymbolContext &sc)
       : ThreadPlan(eKindGeneric, "step-in-async", thread, eVoteNoOpinion,
                    eVoteNoOpinion) {
-    // Using the absence of line table entries as a heuristic, step into
-    // `swift_task_switch`. Then, a breakpoint can be set on the async function.
     assert(sc.function);
     if (!sc.function) {
       return;
@@ -245,13 +247,28 @@ public:
     s->PutCString("ThreadPlanStepInAsync");
   }
 
-  // Composite thread plans never directly explain a stop.
-  bool DoPlanExplainsStop(Event *event) override { return false; }
+  bool DoPlanExplainsStop(Event *event) override {
+    if (!HasTID()) {
+      return false;
+    }
+    auto frame_sp = GetThread().GetStackFrameAtIndex(0);
+    return GetAsyncContext(frame_sp) == m_async_context;
+  }
 
-  // Async stops happen via breakpoint.
-  bool ShouldStop(Event *event) override { return false; }
+  bool ShouldStop(Event *event) override {
+    auto frame_sp = GetThread().GetStackFrameAtIndex(0);
+    if (GetAsyncContext(frame_sp) == m_async_context) {
+      SetPlanComplete();
+      return true;
+    }
+    return false;
+  }
 
   bool MischiefManaged() override {
+    if (IsPlanComplete()) {
+      return true;
+    }
+
     if (!m_step_in_plan_sp->IsPlanComplete()) {
       return false;
     }
@@ -263,11 +280,13 @@ public:
     }
 
     if (!m_async_breakpoint_sp) {
-      m_async_breakpoint_sp = CreateAsyncBreakpoint(GetThread());
+      auto &thread = GetThread();
+      m_async_breakpoint_sp = CreateAsyncBreakpoint(thread);
+      m_async_context = GetAsyncContext(thread.GetStackFrameAtIndex(1));
+      ClearTID();
     }
 
-    SetPlanComplete();
-    return true;
+    return false;
   }
 
   // Override ShouldStop of previous step plan.
@@ -278,6 +297,11 @@ public:
   lldb::StateType GetPlanRunState() override { return eStateRunning; }
 
   bool StopOthers() override { return false; }
+
+  void WillPop() override {
+    m_async_breakpoint_sp->GetTarget().RemoveBreakpointByID(
+        m_async_breakpoint_sp->GetID());
+  }
 
 private:
   static constexpr std::ptrdiff_t taskOffsetOfRunJob64 = 8 * 5;
@@ -290,7 +314,7 @@ private:
                 "lldb assumes an incorrect offset of swift::Task::RunJob");
 #endif
 
-  static BreakpointSP CreateAsyncBreakpoint(Thread &thread) {
+  BreakpointSP CreateAsyncBreakpoint(Thread &thread) {
     auto frame_sp = thread.GetStackFrameAtIndex(0);
     auto reg_ctx = frame_sp->GetRegisterContext();
 
@@ -321,11 +345,38 @@ private:
     auto breakpoint_sp =
         process_sp->GetTarget().CreateBreakpoint(fn_ptr, true, false);
     breakpoint_sp->SetBreakpointKind("async-step");
+    breakpoint_sp->SetCallback(AsyncBreakpointHit, this, true);
     return breakpoint_sp;
+  }
+
+  static bool AsyncBreakpointHit(void *baton, StoppointCallbackContext *context,
+                                 lldb::user_id_t break_id,
+                                 lldb::user_id_t break_loc_id) {
+    auto *plan = reinterpret_cast<ThreadPlanStepInAsync *>(baton);
+    plan->SetTID(context->exe_ctx_ref.GetThreadSP()->GetID());
+    return true;
+  }
+
+  static uint64_t GetAsyncContext(lldb::StackFrameSP frame_sp) {
+    auto reg_ctx_sp = frame_sp->GetRegisterContext();
+    auto arch = reg_ctx_sp->CalculateTarget()->GetArchitecture();
+    int async_context_regnum = 0;
+    if (arch.GetMachine() == llvm::Triple::x86_64) {
+      async_context_regnum = dwarf_r14_x86_64;
+    } else if (arch.GetMachine() == llvm::Triple::aarch64) {
+      async_context_regnum = arm64_dwarf::x22;
+    } else {
+      assert(false && "swift async supports only x86_64 and arm64");
+    }
+
+    auto async_context_reg = reg_ctx_sp->ConvertRegisterKindToRegisterNumber(
+        RegisterKind::eRegisterKindDWARF, async_context_regnum);
+    return reg_ctx_sp->ReadRegisterAsUnsigned(async_context_reg, 23);
   }
 
   ThreadPlanSP m_step_in_plan_sp;
   BreakpointSP m_async_breakpoint_sp;
+  uint64_t m_async_context;
 };
 
 static lldb::ThreadPlanSP GetStepThroughTrampolinePlan(Thread &thread,
