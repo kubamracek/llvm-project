@@ -994,7 +994,7 @@ void Mapper::mapAppendingVariable(GlobalVariable &GV, Constant *InitPrefix,
 
 void Mapper::scheduleMapGlobalInitializer(GlobalVariable &GV, Constant &Init,
                                           unsigned MCID) {
-  assert(AlreadyScheduled.insert(&GV).second && "Should not reschedule");
+  //assert(AlreadyScheduled.insert(&GV).second && "Should not reschedule");
   assert(MCID < MCs.size() && "Invalid mapping context");
 
   WorklistEntry WE;

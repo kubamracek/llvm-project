@@ -158,5 +158,21 @@ Constant *llvm::getPointerAtOffset(Constant *I, uint64_t Offset, Module &M) {
     return getPointerAtOffset(cast<Constant>(I->getOperand(Op)),
                               Offset % ElemSize, M);
   }
+  if (auto *CI = dyn_cast<ConstantInt>(I)) {
+    if (Offset == 0 && CI->getZExtValue() == 0) {
+      return I;
+    }
+  }
+  if (auto *C = dyn_cast<ConstantExpr>(I)) {
+    //llvm::errs() << "ConstantExpr: " << *C << "\n";
+    switch (C->getOpcode()) {
+      case Instruction::Trunc:
+      case Instruction::PtrToInt:
+      case Instruction::Sub:
+        return getPointerAtOffset(cast<Constant>(C->getOperand(0)), Offset, M);
+      default:
+        return nullptr;
+    }
+  }
   return nullptr;
 }

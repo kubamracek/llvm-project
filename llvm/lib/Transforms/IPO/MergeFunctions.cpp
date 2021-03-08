@@ -404,7 +404,7 @@ bool MergeFunctions::doSanityCheck(std::vector<WeakTrackingVH> &Worklist) {
 
 /// Check whether \p F is eligible for function merging.
 static bool isEligibleForMerging(Function &F) {
-  return !F.isDeclaration() && !F.hasAvailableExternallyLinkage();
+  return !F.isDeclaration() && !F.hasAvailableExternallyLinkage() && !F.getName().startswith("__checked_load");
 }
 
 bool MergeFunctions::runOnModule(Module &M) {

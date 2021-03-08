@@ -465,8 +465,8 @@ void MachObjectWriter::recordRelocation(MCAssembler &Asm,
                                         const MCFixup &Fixup, MCValue Target,
                                         uint64_t &FixedValue) {
   if (!isFixupTargetValid(Target)) {
-    Asm.getContext().reportError(Fixup.getLoc(),
-                                 "unsupported relocation expression");
+    //Asm.getContext().reportError(Fixup.getLoc(),
+    //                             "unsupported relocation expression");
     return;
   }
 

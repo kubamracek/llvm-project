@@ -1794,6 +1794,16 @@ bool LowerTypeTestsModule::lower() {
     return true;
   }
 
+  if (DropTypeTests) {
+    // We have deleted the type intrinsics, so we no longer have enough
+    // information to reason about the liveness of virtual function pointers
+    // in GlobalDCE.
+    for (GlobalVariable &GV : M.globals())
+      GV.eraseMetadata(LLVMContext::MD_vcall_visibility);
+
+    return true;
+  }
+
   // If only some of the modules were split, we cannot correctly perform
   // this transformation. We already checked for the presense of type tests
   // with partially split modules during the thin link, and would have emitted

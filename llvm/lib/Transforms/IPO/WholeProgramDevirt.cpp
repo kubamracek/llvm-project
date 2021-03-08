@@ -1196,6 +1196,8 @@ void DevirtModule::tryICallBranchFunnel(
   if (T.getArch() != Triple::x86_64)
     return;
 
+  return;
+
   if (TargetsForSlot.size() > ClThreshold)
     return;
 
