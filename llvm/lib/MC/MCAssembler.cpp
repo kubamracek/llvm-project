@@ -727,8 +727,13 @@ void MCAssembler::layout() {
   }
 }
 
+extern
+void generateRegisterDependencyInfoDump(MCAssembler *assembler);
+
 void MCAssembler::Finish() {
   layout();
+  
+  generateRegisterDependencyInfoDump(this);
 
   // Write the object file.
   stats::ObjectBytes += getWriter().writeObject();

@@ -48,6 +48,7 @@
 #include "llvm/IR/Mangler.h"
 #include "llvm/IR/Module.h"
 #include "llvm/MC/MCAsmInfo.h"
+#include "llvm/MC/MCAssembler.h"
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCInst.h"
 #include "llvm/MC/MCInstBuilder.h"
@@ -3621,4 +3622,383 @@ LLVMInitializeAArch64AsmPrinter() {
   RegisterAsmPrinter<AArch64AsmPrinter> Z(getTheARM64Target());
   RegisterAsmPrinter<AArch64AsmPrinter> W(getTheARM64_32Target());
   RegisterAsmPrinter<AArch64AsmPrinter> V(getTheAArch64_32Target());
+}
+
+// -register-dependency-info-dump-directory extension
+
+extern "C" void LLVMInitializeAArch64Disassembler();
+
+#include "llvm/Support/CommandLine.h"
+#include "llvm/CodeGen/TargetRegisterInfo.h"
+#include "llvm/CodeGen/MachineBasicBlock.h"
+#include "llvm/CodeGen/MachineFunction.h"
+#include "llvm/MC/MCDisassembler/MCDisassembler.h"
+#include "llvm/MC/TargetRegistry.h"
+#include "llvm/MC/MCSubtargetInfo.h"
+#include "llvm/MC/MCInstPrinter.h"
+#include "llvm/MC/MCInstrInfo.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/raw_ostream.h"
+
+static cl::opt<std::string> RegisterDependencyInfoDumpDirectory(
+    "register-dependency-info-dump-directory",
+    cl::Hidden, cl::value_desc("filename"));
+
+static uint64_t offsetInSymbolForBasicBlock(MCAssembler *Assembler, MachineFunction &MF, MachineBasicBlock &EntryBB, MachineBasicBlock &MBB) {
+  uint64_t EntryBBOffset = Assembler->BBToOffsetMap[&EntryBB] + Assembler->getFragmentOffset(Assembler->BBToFragmentMap[&EntryBB]);
+  uint64_t BBOffset = Assembler->BBToOffsetMap[&MBB] + Assembler->getFragmentOffset(Assembler->BBToFragmentMap[&MBB]);
+  return BBOffset - EntryBBOffset;
+}
+
+void writeRegisterDependencyInfoToFile(MCAssembler *assembler, MachineFunction &MF, raw_ostream &OS, bool isFirst) {
+  const TargetInstrInfo &TII = *MF.getSubtarget().getInstrInfo();
+
+  if (!isFirst) OS << ",\n";
+
+  OS << "  {\n";
+  OS << "    \"function\": \"" << MF.getName() << "\",\n";
+  OS << "    \"symbol\": \"_" << MF.getName() << "\",\n";
+  OS << "    \"basic_blocks\": [\n";
+
+  bool firstBB = true;
+  for (MachineBasicBlock &MBB : MF) {
+    if (!firstBB) OS << ",\n";
+    firstBB = false;
+
+    OS << "      {\n";
+    OS << "        \"bb_number\": " << MBB.getNumber() << ",\n";
+    OS << "        \"offset_in_symbol\": " << offsetInSymbolForBasicBlock(assembler, MF, *MF.getBlockNumbered(0), MBB) << ",\n";
+    OS << "        \"instructions\": [\n";
+
+    bool firstInst = true;
+    for (const MachineInstr &MI : MBB) {
+      if (MI.isDebugOrPseudoInstr() || MI.isPosition())
+        continue;
+
+      if (!firstInst) OS << ",\n";
+      firstInst = false;
+
+      OS << "          { \"opcode\": \"" << TII.getName(MI.getOpcode()) << "\", ";
+
+      SmallVector<std::string, 8> Defs, Uses;
+
+      for (unsigned i = 0; i < MI.getNumOperands(); ++i) {
+        const MachineOperand &MO = MI.getOperand(i);
+        std::string OpStr;
+
+        switch (MO.getType()) {
+          case MachineOperand::MO_Register: {
+            assert(!(MO.isDef() && MO.isUse()) && "Operand cannot be both def and use");
+
+            OpStr = "reg:";
+            if (MO.getReg().isPhysical()) {
+              OpStr += AArch64InstPrinter::getRegisterName(MO.getReg());
+            } else {
+              OpStr += "virtual_" + std::to_string(MO.getReg());
+            }
+
+            if (MO.isImplicit()) OpStr += "/implicit";
+            if (MO.isInternalRead()) OpStr += "/internal_read";
+            if (MO.isDead()) OpStr += "/dead";
+            if (MO.isKill()) OpStr += "/kill";
+            if (MO.isUndef()) OpStr += "/undef";
+            if (MO.isEarlyClobber()) OpStr += "/early_clobber";
+            if (MO.getReg().isPhysical() && MO.isRenamable()) OpStr += "/renamable";
+
+            if (MO.isDef()) {
+              Defs.push_back(OpStr);
+            } else {
+              Uses.push_back(OpStr);
+            }
+            break;
+          }
+          case MachineOperand::MO_Immediate:
+            OpStr = "imm:" + std::to_string(MO.getImm());
+            Uses.push_back(OpStr);
+            break;
+            case MachineOperand::MO_GlobalAddress: {
+              std::string GlobalName = MO.getGlobal()->getName().str();
+              // Escape JSON invalid characters
+              std::string EscapedName;
+              for (char c : GlobalName) {
+                switch (c) {
+                  case '"': EscapedName += "\\\""; break;
+                  case '\\': EscapedName += "\\\\"; break;
+                  case '\b': EscapedName += "\\b"; break;
+                  case '\f': EscapedName += "\\f"; break;
+                  case '\n': EscapedName += "\\n"; break;
+                  case '\r': EscapedName += "\\r"; break;
+                  case '\t': EscapedName += "\\t"; break;
+                  default:
+                    if (c < 0x20) {
+                      EscapedName += "\\u" + std::to_string((unsigned char)c);
+                    } else {
+                      EscapedName += c;
+                    }
+                    break;
+                }
+              }
+              OpStr = "global:" + EscapedName;
+              Uses.push_back(OpStr);
+              break;
+            }
+          case MachineOperand::MO_BlockAddress:
+            OpStr = "block_address";
+            Uses.push_back(OpStr);
+            break;
+          case MachineOperand::MO_MachineBasicBlock:
+            OpStr = "bb:" + std::to_string(MO.getMBB()->getNumber());
+            Uses.push_back(OpStr);
+            break;
+          case MachineOperand::MO_FrameIndex:
+            OpStr = "fi:" + std::to_string(MO.getIndex());
+            Uses.push_back(OpStr);
+            break;
+          case MachineOperand::MO_ConstantPoolIndex:
+            OpStr = "cp:" + std::to_string(MO.getIndex());
+            Uses.push_back(OpStr);
+            break;
+          default:
+            OpStr = "other";
+            Uses.push_back(OpStr);
+            break;
+        }
+      }
+
+      OS << "\"defs\": [";
+      for (size_t i = 0; i < Defs.size(); ++i) {
+        if (i > 0) OS << ", ";
+        OS << "\"" << Defs[i] << "\"";
+      }
+      OS << "], ";
+
+      OS << "\"uses\": [";
+      for (size_t i = 0; i < Uses.size(); ++i) {
+        if (i > 0) OS << ", ";
+        OS << "\"" << Uses[i] << "\"";
+      }
+      OS << "] ";
+
+      OS << "}";
+    }
+
+    OS << "\n        ]\n";
+    OS << "      }";
+  }
+
+  OS << "\n    ]\n";
+  OS << "  }";
+}
+
+void dumpFunctionBasicBlockInfo(MCAssembler *assembler, MCDisassembler *Disasm, MCInstPrinter *InstPrinter, MachineFunction *MF, raw_fd_ostream *JSONFile, bool isFirst) {
+  errs() << "Function: " << MF->getName() << " (" << MF << ")\n";
+
+  for (MachineBasicBlock &BB : *MF) {
+    MachineBasicBlock *BBPtr = &BB;
+
+    // Look up the fragment for this BB
+    MCFragment *Frag = assembler->BBToFragmentMap[BBPtr];
+
+    errs() << "  BB: " << BBPtr << " -> Fragment: " << Frag << "\n";
+
+    // Get offset in fragment for this BB
+    uint64_t BBOffset = 0;
+    auto OffsetIt = assembler->BBToOffsetMap.find(BBPtr);
+    if (OffsetIt != assembler->BBToOffsetMap.end()) {
+      BBOffset = OffsetIt->second;
+    }
+
+    errs() << "    Offset in fragment: " << BBOffset << "\n";
+
+    // Disassemble first 3 instructions from this fragment
+    if (Frag && (Frag->getKind() == MCFragment::FT_Data || 
+                  Frag->getKind() == MCFragment::FT_Align ||
+                  Frag->getKind() == MCFragment::FT_Relaxable)) {
+      MutableArrayRef<char> Contents = Frag->getContents();
+      if (BBOffset < Contents.size()) {
+        const uint8_t *Data = reinterpret_cast<const uint8_t*>(Contents.data() + BBOffset);
+        size_t RemainingSize = Contents.size() - BBOffset;
+
+        errs() << "    First 3 instructions:\n";
+        size_t Offset = 0;
+        for (int InstCount = 0; InstCount < 3 && Offset < RemainingSize; InstCount++) {
+          errs() << "      [" << (BBOffset + Offset) << "] ";
+
+          // Print raw bytes in reverse order without spaces
+          size_t BytesToShow = std::min(size_t(4), RemainingSize - Offset);
+          for (int I = BytesToShow - 1; I >= 0; I--) {
+            errs() << format("%02x", Data[Offset + I]);
+          }
+
+          // Try to disassemble the instruction
+          if (Disasm) {
+            MCInst Inst;
+            uint64_t InstSize;
+            ArrayRef<uint8_t> ByteSlice(Data + Offset, RemainingSize - Offset);
+
+            MCDisassembler::DecodeStatus Status = Disasm->getInstruction(
+                Inst, InstSize, ByteSlice, BBOffset + Offset, llvm::nulls());
+
+            if (Status == MCDisassembler::Success) {
+              errs() << " ; ";
+              // Print the instruction mnemonic and operands using MCInstPrinter
+              if (InstPrinter) {
+                InstPrinter->printInst(&Inst, BBOffset + Offset, "", 
+                                      *assembler->getContext().getSubtargetInfo(), errs());
+              } else {
+                Inst.dump_pretty(errs());
+              }
+              Offset += InstSize;
+            } else {
+              errs() << " ; <decode failed>";
+              // Move to next instruction (simplified - assumes 4 byte instructions)
+              Offset += 4;
+            }
+          } else {
+            errs() << " ; <disassembler not available>";
+            // Move to next instruction (simplified - assumes 4 byte instructions)
+            Offset += 4;
+          }
+
+          errs() << "\n";
+
+          if (Offset >= RemainingSize) break;
+        }
+      }
+    }
+    errs() << "\n";
+  }
+}
+
+extern
+void generateRegisterDependencyInfoDump(MCAssembler *assembler) {
+  if (RegisterDependencyInfoDumpDirectory.empty()) return;
+  
+  // Dump all sections, symbols, fragments and their sizes and offsets
+  // errs() << "Final layout dump:\n";
+  // errs() << "==================\n";
+
+  // Dump symbols
+  // errs() << "Symbols:\n";
+  // for (const MCSymbol &Sym : symbols()) {
+  //   if (Sym.getName().empty())
+  //     continue;
+  //   errs() << "  Symbol: " << Sym.getName();
+  //   if (Sym.isDefined()) {
+  //     uint64_t Offset;
+  //     if (getSymbolOffset(Sym, Offset)) {
+  //       errs() << " (Offset: " << Offset << ")";
+  //     }
+  //     if (auto *F = Sym.getFragment()) {
+  //       errs() << " (Fragment Offset: " << Sym.getOffset() << ")";
+  //     }
+  //   } else {
+  //     errs() << " (Undefined)";
+  //   }
+  //   if (Sym.isVariable()) {
+  //     errs() << " (Variable)";
+  //   }
+  //   errs() << "\n";
+  // }
+  // errs() << "==================\n";
+
+  // Dump basic blocks and their fragments with disassembly
+  // errs() << "Basic Blocks and Fragments:\n";
+
+  // Gather all MachineFunctions by collecting parents of basic blocks
+  std::set<MachineFunction*> MachineFunctions;
+  for (const auto &BBEntry : assembler->BBToFragmentMap) {
+    MachineBasicBlock *BB = BBEntry.first;
+    if (BB && BB->getParent()) {
+      MachineFunctions.insert(BB->getParent());
+    }
+  }
+
+  // Sort functions by getFunctionNumber()
+  std::vector<MachineFunction*> SortedFunctions(MachineFunctions.begin(), MachineFunctions.end());
+  std::sort(SortedFunctions.begin(), SortedFunctions.end(), 
+            [](const MachineFunction* A, const MachineFunction* B) {
+              return A->getFunctionNumber() < B->getFunctionNumber();
+            });
+
+  // LLVMInitializeAArch64Disassembler();
+
+  // Get a disassembler and instruction printer for instruction decoding
+  // MCDisassembler *Disasm = nullptr;
+  // MCInstPrinter *InstPrinter = nullptr;
+  // if (assembler->getBackendPtr()) {
+  //   const MCSubtargetInfo *STI = assembler->getContext().getSubtargetInfo();
+
+  //   auto TT = STI->getTargetTriple();
+  //   std::string Error;
+  //   const Target *TheTarget = TargetRegistry::lookupTarget(TT, Error);
+  //   if (!TheTarget) {
+  //     errs() << "Error: " << Error << "\n";
+  //   } else {
+  //     Disasm = TheTarget->createMCDisassembler(*STI, assembler->getContext());
+  //     if (!Disasm) {
+  //       errs() << "Warning: Disassembler not available for target\n";
+  //     } else {
+  //       errs() << "Disassembler created successfully for target\n";
+  //     }
+
+  //     // Create MCInstPrinter
+  //     MCTargetOptions MCOptions;
+  //     std::unique_ptr<MCInstrInfo> MCII(TheTarget->createMCInstrInfo());
+  //     const MCRegisterInfo *MRI = assembler->getContext().getRegisterInfo();
+  //     std::unique_ptr<MCAsmInfo> AsmInfo(
+  //         TheTarget->createMCAsmInfo(*MRI, TT, MCOptions));
+  //     if (AsmInfo) {
+  //       InstPrinter = TheTarget->createMCInstPrinter(
+  //           TT, AsmInfo->getAssemblerDialect(), *AsmInfo, 
+  //           *MCII, *MRI);
+  //     }
+  //   }
+  // }
+
+  // Create single JSON file for all functions if directory is specified
+  raw_fd_ostream *JSONFile = nullptr;
+  std::unique_ptr<raw_fd_ostream> JSONFileOwner;
+
+  // Create directory if it doesn't exist
+  SmallString<256> DirPath(RegisterDependencyInfoDumpDirectory);
+  std::error_code EC = llvm::sys::fs::create_directories(DirPath);
+  if (EC) {
+    errs() << "Warning: Could not create directory " << DirPath << ": " << EC.message() << "\n";
+  } else {
+    std::string ModuleName = SortedFunctions[0]->getFunction().getParent()->getName().str();
+
+    // Replace invalid filename characters
+    auto sanitize = [](std::string &name) {
+      for (char &c : name) {
+        if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || 
+            c == '"' || c == '<' || c == '>' || c == '|') {
+          c = '_';
+        }
+      }
+    };
+
+    sanitize(ModuleName);
+
+    std::string FileName = RegisterDependencyInfoDumpDirectory + "/" + ModuleName + ".json";
+    JSONFileOwner = std::make_unique<raw_fd_ostream>(FileName, EC, sys::fs::OF_Text);
+    if (!EC) {
+      JSONFile = JSONFileOwner.get();
+      // Start JSON array
+      *JSONFile << "[\n";
+    }
+  }
+
+  // Print BB+fragment information organized by function
+  bool isFirstFunction = true;
+  for (MachineFunction *MF : SortedFunctions) {
+    writeRegisterDependencyInfoToFile(assembler, *MF, *JSONFile, isFirstFunction);
+
+    //dumpFunctionBasicBlockInfo(assembler, Disasm, InstPrinter, MF, JSONFile, isFirstFunction);
+    isFirstFunction = false;
+  }
+
+  // Close JSON array and file
+  *JSONFile << "\n]\n";
+  JSONFileOwner.reset(); // This closes the file
 }

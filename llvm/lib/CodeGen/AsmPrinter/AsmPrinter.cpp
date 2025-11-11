@@ -87,6 +87,7 @@
 #include "llvm/IR/Value.h"
 #include "llvm/IR/ValueHandle.h"
 #include "llvm/MC/MCAsmInfo.h"
+#include "llvm/MC/MCAssembler.h"
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCDirectives.h"
 #include "llvm/MC/MCExpr.h"
@@ -1934,6 +1935,11 @@ void AsmPrinter::emitFunctionBody() {
   for (auto &MBB : *MF) {
     // Print a label for the basic block.
     emitBasicBlockStart(MBB);
+    
+    MCFragment *CurF = OutStreamer->getCurrentFragment();
+    OutStreamer->getAssemblerPtr()->BBToFragmentMap[&MBB] = CurF;
+    OutStreamer->getAssemblerPtr()->BBToOffsetMap[&MBB] = CurF->getFixedSize();
+    
     DenseMap<StringRef, unsigned> MnemonicCounts;
     for (auto &MI : MBB) {
       // Print the assembly for the instruction.

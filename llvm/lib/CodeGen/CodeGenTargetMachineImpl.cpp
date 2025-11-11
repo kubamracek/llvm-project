@@ -242,7 +242,7 @@ bool CodeGenTargetMachineImpl::addPassesToEmitFile(
       PM.add(createPrintMIRPass(Out));
   }
 
-  PM.add(createFreeMachineFunctionPass());
+  //PM.add(createFreeMachineFunctionPass());
   return false;
 }
 

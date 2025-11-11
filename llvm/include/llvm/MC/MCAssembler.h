@@ -45,12 +45,17 @@ class MCFragment;
 class MCObjectWriter;
 class MCSection;
 class MCValue;
+class MachineBasicBlock;
 
 class MCAssembler {
 public:
   friend class MCObjectWriter;
   using SectionListType = SmallVector<MCSection *, 0>;
   using const_iterator = pointee_iterator<SectionListType::const_iterator>;
+
+  std::unordered_map<MachineBasicBlock *, MCFragment *> BBToFragmentMap;
+  std::unordered_map<MachineBasicBlock *, size_t> BBToOffsetMap;
+  uint64_t getFragmentOffset(MCFragment *F) { return F->Offset; }
 
 private:
   MCContext &Context;
