@@ -3731,7 +3731,9 @@ void writeRegisterDependencyInfoToFile(MCAssembler *assembler, MachineFunction &
                   case '\t': EscapedName += "\\t"; break;
                   default:
                     if (c < 0x20) {
-                      EscapedName += "\\u" + std::to_string((unsigned char)c);
+                      char buffer[7];
+                      snprintf(buffer, sizeof(buffer), "\\u%04x", (unsigned char)c);
+                      EscapedName += buffer;
                     } else {
                       EscapedName += c;
                     }
