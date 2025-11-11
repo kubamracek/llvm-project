@@ -3920,6 +3920,8 @@ void generateRegisterDependencyInfoDump(MCAssembler *assembler) {
             [](const MachineFunction* A, const MachineFunction* B) {
               return A->getFunctionNumber() < B->getFunctionNumber();
             });
+  
+  if (SortedFunctions.empty()) return;
 
   // LLVMInitializeAArch64Disassembler();
 
