@@ -46,6 +46,7 @@ class MCObjectWriter;
 class MCSection;
 class MCValue;
 class MachineBasicBlock;
+class MachineInstr;
 
 class MCAssembler {
 public:
@@ -55,6 +56,8 @@ public:
 
   std::unordered_map<MachineBasicBlock *, MCFragment *> BBToFragmentMap;
   std::unordered_map<MachineBasicBlock *, size_t> BBToOffsetMap;
+  std::unordered_map<MachineInstr *, MCFragment *> MIToFragmentMap;
+  std::unordered_map<MachineInstr *, size_t> MIToOffsetMap;
   uint64_t getFragmentOffset(MCFragment *F) { return F->Offset; }
 
 private:

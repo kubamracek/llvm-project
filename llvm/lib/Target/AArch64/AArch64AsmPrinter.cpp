@@ -3650,6 +3650,12 @@ static uint64_t offsetInSymbolForBasicBlock(MCAssembler *Assembler, MachineFunct
   return BBOffset - EntryBBOffset;
 }
 
+static uint64_t offsetInSymbolForMachineInstr(MCAssembler *Assembler, MachineFunction &MF, MachineBasicBlock &EntryBB, MachineInstr &MI) {
+  uint64_t EntryBBOffset = Assembler->BBToOffsetMap[&EntryBB] + Assembler->getFragmentOffset(Assembler->BBToFragmentMap[&EntryBB]);
+  uint64_t MIOffset = Assembler->MIToOffsetMap[&MI] + Assembler->getFragmentOffset(Assembler->MIToFragmentMap[&MI]);
+  return MIOffset - EntryBBOffset;
+}
+
 void writeRegisterDependencyInfoToFile(MCAssembler *assembler, MachineFunction &MF, raw_ostream &OS, bool isFirst) {
   const TargetInstrInfo &TII = *MF.getSubtarget().getInstrInfo();
 
@@ -3671,14 +3677,15 @@ void writeRegisterDependencyInfoToFile(MCAssembler *assembler, MachineFunction &
     OS << "        \"instructions\": [\n";
 
     bool firstInst = true;
-    for (const MachineInstr &MI : MBB) {
+    for (MachineInstr &MI : MBB) {
       if (MI.isDebugOrPseudoInstr() || MI.isPosition())
         continue;
 
       if (!firstInst) OS << ",\n";
       firstInst = false;
 
-      OS << "          { \"opcode\": \"" << TII.getName(MI.getOpcode()) << "\", ";
+      uint64_t o = offsetInSymbolForMachineInstr(assembler, MF, *MF.getBlockNumbered(0), MI);
+      OS << "          { \"offset_in_symbol\": " << o << ", \"opcode\": \"" << TII.getName(MI.getOpcode()) << "\", ";
 
       SmallVector<std::string, 8> Defs, Uses;
 

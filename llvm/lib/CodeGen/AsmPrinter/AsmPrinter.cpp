@@ -1960,6 +1960,10 @@ void AsmPrinter::emitFunctionBody() {
 
       if (isVerbose())
         emitComments(MI, STI, OutStreamer->getCommentOS());
+      
+      MCFragment *CurF = OutStreamer->getCurrentFragment();
+      OutStreamer->getAssemblerPtr()->MIToFragmentMap[&MI] = CurF;
+      OutStreamer->getAssemblerPtr()->MIToOffsetMap[&MI] = CurF->getFixedSize();
 
       switch (MI.getOpcode()) {
       case TargetOpcode::CFI_INSTRUCTION:
