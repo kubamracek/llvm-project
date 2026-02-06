@@ -327,3 +327,396 @@ bool AArch64CondBrTuning::runOnMachineFunction(MachineFunction &MF) {
 FunctionPass *llvm::createAArch64CondBrTuning() {
   return new AArch64CondBrTuning();
 }
+
+
+
+
+
+
+
+
+namespace llvm { FunctionPass *createAArch64GOTRewrite(); }
+namespace llvm { void initializeAArch64GOTRewritePass(PassRegistry &); }
+
+
+
+
+
+
+
+#define DEBUG_TYPE "aarch64-got-rewrite"
+#define AARCH64_GOT_REWRITE_NAME "AArch64 GOT Rewrite"
+//#define LLVM_DEBUG(x) x
+
+// Stress testing mode - disable heuristics.
+static cl::opt<bool> EnableGOTRewrite("enable-got-rewrite", cl::Hidden);
+
+namespace {
+class AArch64GOTRewrite : public MachineFunctionPass {
+  const AArch64InstrInfo *TII;
+  const TargetRegisterInfo *TRI;
+
+  MachineRegisterInfo *MRI;
+
+public:
+  static char ID;
+  AArch64GOTRewrite() : MachineFunctionPass(ID) {}
+  void getAnalysisUsage(AnalysisUsage &AU) const override;
+  bool runOnMachineFunction(MachineFunction &MF) override;
+  StringRef getPassName() const override { return AARCH64_GOT_REWRITE_NAME; }
+
+private:
+  bool convertBLToGOTCall(MachineInstr &MI);
+};
+} // end anonymous namespace
+
+char AArch64GOTRewrite::ID = 0;
+
+INITIALIZE_PASS(AArch64GOTRewrite, "aarch64-got-rewrite",
+                AARCH64_GOT_REWRITE_NAME, false, false)
+
+void AArch64GOTRewrite::getAnalysisUsage(AnalysisUsage &AU) const {
+  AU.setPreservesCFG();
+  MachineFunctionPass::getAnalysisUsage(AU);
+}
+
+// Global whitelist of function names to convert to GOT calls
+static const char *GOTCallWhitelist[] = {
+  "expf",
+  "fmodf",
+  "memcpy",
+  "cosf",
+  "powf",
+  "pthread_getspecific",
+  "bzero",
+  "acosf",
+  "__sincosf_stret",
+  "free",
+  "log2",
+  "memmove",
+  "_platform_bzero",
+  "atan2f",
+  "malloc_type_malloc",
+  "memcmp",
+  "_Znwm",
+  "_ZdlPv",
+  "memset",
+  "logf",
+  "strlen",
+  "memchr",
+  "_platform_strcmp",
+  "strcmp",
+  "mkdtempat_np",
+  "pthread_mutex_unlock",
+  "pthread_mutex_lock",
+  "_ZNKSt3__112basic_stringIcNS_11char_tr",
+  "_ZNSt3__15mutex6unlockEv",
+  "_ZNSt3__15mutex4lockEv",
+  "__memcpy_chk",
+  "calloc",
+  "memset_pattern16",
+  "strcasecmp",
+  "malloc",
+  "cos",
+  "mach_absolute_time",
+  "realloc",
+  "_ZdlPvSt11align_val_t",
+  "hypot",
+  "mbrtowc",
+  "strsignal_r",
+  "log",
+  "pthread_mutex_destroy",
+  "_ZNSt3__112basic_stringIcNS_11char_tra",
+  "strdup",
+  "_ZNSt3__15mutexD1Ev",
+  "malloc_type_aligned_alloc",
+  "_ZnwmSt11align_val_t",
+  "_platform_memmove",
+  "atoi",
+  "sigprocmask",
+  "os_unfair_lock_unlock",
+  "os_unfair_lock_lock",
+  "mach_vm_reclaim_update_kernel_accounti",
+  "mkostemps",
+  "pow",
+  "exp",
+  "_ZNKSt3__16locale9use_facetERNS0_2idE",
+  "_ZNSt3__16locale7classicEv",
+  "mach_vm_reclaim_try_enter",
+  "setjmp",
+  "__memset_chk",
+  "mach_vm_reclaim_is_reusable",
+  "mach_vm_reclaim_try_cancel",
+  "atof",
+  "pthread_mutex_trylock",
+  "_Znam",
+  "_ZdaPv",
+  "log10",
+  "__exp10",
+  "_ZNSt3__112basic_stringIcNS_11char_tra",
+  "strtod",
+  "__tolower",
+  "__platform_sigaction",
+  "__sigaction",
+  "_ZNSt3__112basic_stringIcNS_11char_tra",
+  "pthread_setspecific",
+  "sigaction",
+  "_ZNSt3__112basic_stringIcNS_11char_tra",
+  "_ZNSt3__112basic_stringIcNS_11char_tra",
+  "sinf",
+  "__error",
+  "sin",
+  "_platform_memset",
+  "_ZNSt3__113basic_ostreamIcNS_11char_tr",
+  "_ZNSt3__113basic_ostreamIcNS_11char_tr",
+  "catgets",
+  "_ZNSt3__16localeD1Ev",
+  "mach_timebase_info",
+  "bsearch",
+  "flsl",
+  "sigsetjmp",
+  "strchr",
+  "_ZNSt3__112basic_stringIcNS_11char_tra",
+  "_ZnwmSt19__type_descriptor_t",
+  "_ZNSt3__112basic_stringIcNS_11char_tra",
+  "_ZNSt3__18ios_base4initEPv",
+  "_ZNSt3__16localeC1Ev",
+  "_ZNSt3__19basic_iosIcNS_11char_traitsI",
+  "_ZNSt3__113basic_ostreamIcNS_11char_tr",
+  "strtol",
+  "qsort",
+  "pthread_cond_signal",
+  "clock_gettime",
+  "mach_continuous_time",
+  "snprintf",
+  "pthread_cond_broadcast",
+  "_ZNSt3__112__next_primeEm",
+  "pthread_self",
+  "snprintf_l",
+  "rand",
+  "_ZNKSt3__115basic_stringbufIcNS_11char",
+  "_ZNSt3__16chrono12steady_clock3nowEv",
+  "wcslen",
+  "_ZNSt3__119__shared_mutex_base8try_loc",
+  "_ZNSt3__119__shared_mutex_base6unlockE",
+  "_ZNSt3__116generic_categoryEv",
+  "_ZdlPvm",
+  "_ZNSt3__113basic_ostreamIcNS_11char_tr",
+  "_ZNSt3__14stodERKNS_12basic_stringIcNS",
+  "strcpy",
+  "_ZNKSt3__18ios_base6getlocEv",
+  "_ZNSt3__111timed_mutex6unlockEv",
+  "acos",
+  "pthread_rwlock_unlock",
+  "pthread_rwlock_rdlock",
+  "_ZnwmRKSt9nothrow_t",
+  "_ZNSt3__115system_categoryEv",
+  "_ZNSt3__19to_stringEj",
+  "_ZNSt3__112basic_stringIcNS_11char_tra",
+  "posix_memalign",
+  "_ZNSt3__15mutex8try_lockEv",
+  "__sincos_stret",
+  "strpbrk",
+  "__dynamic_cast",
+  "strstr",
+  "_ZNSt3__118condition_variable10notify_",
+  "mmap",
+  "fegetenv",
+  "_platform_strncmp",
+  "__sysctl",
+  "strncmp",
+  "munmap",
+  "_ZNSt3__119__shared_mutex_base15try_lo",
+  "_ZNSt3__119__shared_mutex_base13unlock",
+  "_ZNSt3__112basic_stringIcNS_11char_tra",
+  "__commpage_gettimeofday",
+  "os_unfair_lock_lock_with_options",
+  "_ZNSt3__16__sortIRNS_6__lessIiiEEPiEEv",
+  "_ZNKSt3__112basic_stringIcNS_11char_tr",
+  "strtoul",
+  "fesetenv",
+  "gettimeofday",
+  "strncasecmp",
+  "sysctlbyname",
+  "_ZNSt3__19to_stringEi",
+  "_ZNSt3__112basic_stringIcNS_11char_tra",
+  "_ZNSt3__113basic_ostreamIcNS_11char_tr",
+  "__toupper",
+  "_ZNSt3__113basic_ostreamIcNS_11char_tr",
+  "_ZNSt3__112basic_stringIcNS_11char_tra",
+  "_ZNSt3__119__shared_weak_count14__rele",
+  "os_unfair_lock_assert_owner",
+  "malloc_default_zone",
+  "pthread_cond_destroy",
+  "pthread_mach_thread_np",
+  "getentropy",
+  "pthread_mutex_init",
+  "mach_vm_map",
+  "os_set_32_ptr_find",
+  "notify_check",
+  "pthread_mutexattr_init",
+  "pthread_mutexattr_settype",
+  "pthread_mutexattr_destroy",
+  "_ZNSt3__118condition_variableD1Ev",
+  "__cxa_guard_acquire",
+  "__cxa_guard_release",
+  "getenv",
+  "_ZNSt3__111__call_onceERVmPvPFvS2_E",
+  "pthread_rwlock_wrlock",
+  "malloc_zone_free",
+  "object_getClass",
+  "time",
+  "memset_s",
+  "strrchr",
+  "localtime_r",
+  "mach_vm_reclaim_query_state",
+  "vsnprintf",
+  "malloc_type_zone_malloc",
+  "strncpy",
+  "_ZNSt3__115recursive_mutex4lockEv",
+  "_ZNSt3__115recursive_mutex6unlockEv",
+  "mach_boottime_usec",
+  "_ZNSt3__119__shared_mutex_baseC1Ev",
+  "ldexp",
+  "object_setClass",
+  "_Block_object_dispose",
+  "malloc_good_size",
+  "objc_destructInstance",
+  "CFRelease",
+  "__cxa_atexit",
+  "clock_gettime_nsec_np",
+  "malloc_type_zone_calloc",
+  "uuid_generate_random",
+  "madvise",
+  "__powidf2",
+  "CFUUIDCreate",
+  "CFUUIDCreateString",
+  "CFStringGetFastestEncoding",
+  "CFStringGetCStringPtr",
+  "_ZNSt3__1plIcNS_11char_traitsIcEENS_9a",
+  "kdebug_trace",
+  "pthread_once",
+  "strtoll",
+  "ioctl",
+  "_os_once",
+  "isatty",
+  "uname",
+  "_ZNSt3__112basic_stringIcNS_11char_tra",
+  "_ZNSt3__118condition_variable10notify_",
+  "exp2f",
+  "mkostemp",
+  "cbrtf",
+  "_ZNSt3__15mutexD2Ev",
+  "dladdr",
+  "open$NOCANCEL",
+  "__memmove_chk",
+  "atexit",
+  "gmtime",
+  "opendir",
+  "_ZNSt3__115recursive_mutexC1Ev",
+  "pthread_key_create",
+  "tanf",
+  "strtoencf16",
+  "mach_vm_reclaim_ring_capacity",
+  "sysconf",
+  "__strncpy_chk",
+  "_ZNSt3__112basic_stringIcNS_11char_tra",
+  "pthread_key_delete",
+  "mach_vm_reclaim_round_capacity",
+  "mach_vm_reclaim_ring_resize",
+  "__strcat_chk",
+  "pthread_cond_init",
+  "getpid",
+  "_ZNSt3__19to_stringEy",
+  "_ZNSt3__19to_stringEm",
+  "_ZNSt3__19to_stringEx",
+  "_ZNSt3__16thread20hardware_concurrency",
+};
+
+bool AArch64GOTRewrite::convertBLToGOTCall(MachineInstr &MI) {
+  LLVM_DEBUG(dbgs() << "  Checking instruction: "; MI.dump());
+
+  // Get the function being called
+  const MachineOperand &CalleeOp = MI.getOperand(0);
+  LLVM_DEBUG(dbgs() << "    Operand: "; CalleeOp.dump());
+
+  const char *SymbolName = nullptr;
+
+  if (CalleeOp.isSymbol()) {
+    SymbolName = CalleeOp.getSymbolName();
+    LLVM_DEBUG(dbgs() << "    Calling external symbol: " << SymbolName << "\n");
+  } else if (CalleeOp.isGlobal()) {
+    // Check if this is a global with one of the whitelisted names
+    const GlobalValue *GV = CalleeOp.getGlobal();
+    if (GV && GV->hasName()) {
+      StringRef Name = GV->getName();
+      for (const char *WhitelistedName : GOTCallWhitelist) {
+        if (Name == WhitelistedName) {
+          SymbolName = GV->getName().data();
+          LLVM_DEBUG(dbgs() << "    Calling global function: " << SymbolName << "\n");
+          break;
+        }
+      }
+    }
+  }
+
+  if (!SymbolName) {
+    LLVM_DEBUG(dbgs() << "    Not a symbol or whitelisted global\n");
+    return false;
+  }
+
+  LLVM_DEBUG(dbgs() << "    Converting to GOT-based call\n");
+
+  MachineBasicBlock &MBB = *MI.getParent();
+  DebugLoc DL = MI.getDebugLoc();
+
+  // Create a virtual register to hold the function address
+  Register FuncAddrReg = MRI->createVirtualRegister(&AArch64::GPR64RegClass);
+
+  // Create LOADgot pseudo-instruction to load the function address from GOT
+  BuildMI(MBB, MI, DL, TII->get(AArch64::LOADgot), FuncAddrReg)
+      .addExternalSymbol(SymbolName);
+
+  // Create BLR instruction to call through the register
+  MachineInstrBuilder BLR = BuildMI(MBB, MI, DL, TII->get(AArch64::BLR))
+      .addReg(FuncAddrReg);
+
+  // Copy over implicit operands (like implicit defs/uses)
+  for (const MachineOperand &MO : MI.implicit_operands())
+    BLR.add(MO);
+
+  // Remove the original BL instruction
+  MI.eraseFromParent();
+
+  return true;
+}
+
+bool AArch64GOTRewrite::runOnMachineFunction(MachineFunction &MF) {
+  if (!EnableGOTRewrite || skipFunction(MF.getFunction()))
+    return false;
+
+  LLVM_DEBUG(
+      dbgs() << "********** AArch64 GOT Rewrite **********\n"
+             << "********** Function: " << MF.getName() << '\n');
+
+  TII = static_cast<const AArch64InstrInfo *>(MF.getSubtarget().getInstrInfo());
+  TRI = MF.getSubtarget().getRegisterInfo();
+  MRI = &MF.getRegInfo();
+
+  bool Changed = false;
+  for (MachineBasicBlock &MBB : MF) {
+    for (auto MII = MBB.begin(), MIE = MBB.end(); MII != MIE; ) {
+      MachineInstr &MI = *MII++;
+      if (MI.getOpcode() == AArch64::BL && convertBLToGOTCall(MI)) {
+        Changed = true;
+        LLVM_DEBUG(dbgs() << "  Converted BL to GOT-based call\n");
+      }
+    }
+  }
+
+  return Changed;
+}
+
+FunctionPass *llvm::createAArch64GOTRewrite() {
+  return new AArch64GOTRewrite();
+}

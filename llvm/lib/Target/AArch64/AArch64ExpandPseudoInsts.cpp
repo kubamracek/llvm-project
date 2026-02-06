@@ -1442,22 +1442,22 @@ bool AArch64ExpandPseudo::expandMI(MachineBasicBlock &MBB,
       }
 
       if (MO1.isGlobal()) {
-        MIB1.addGlobalAddress(MO1.getGlobal(), 0, Flags | AArch64II::MO_PAGE);
+        MIB1.addGlobalAddress(MO1.getGlobal(), 0, Flags | AArch64II::MO_PAGE | AArch64II::MO_GOT);
         MIB2.addGlobalAddress(MO1.getGlobal(), 0,
-                              Flags | AArch64II::MO_PAGEOFF | AArch64II::MO_NC);
+                              Flags | AArch64II::MO_PAGEOFF | AArch64II::MO_NC | AArch64II::MO_GOT);
       } else if (MO1.isSymbol()) {
-        MIB1.addExternalSymbol(MO1.getSymbolName(), Flags | AArch64II::MO_PAGE);
+        MIB1.addExternalSymbol(MO1.getSymbolName(), Flags | AArch64II::MO_PAGE | AArch64II::MO_GOT);
         MIB2.addExternalSymbol(MO1.getSymbolName(), Flags |
                                                         AArch64II::MO_PAGEOFF |
-                                                        AArch64II::MO_NC);
+                                                        AArch64II::MO_NC | AArch64II::MO_GOT);
       } else {
         assert(MO1.isCPI() &&
                "Only expect globals, externalsymbols, or constant pools");
         MIB1.addConstantPoolIndex(MO1.getIndex(), MO1.getOffset(),
-                                  Flags | AArch64II::MO_PAGE);
+                                  Flags | AArch64II::MO_PAGE | AArch64II::MO_GOT);
         MIB2.addConstantPoolIndex(MO1.getIndex(), MO1.getOffset(),
                                   Flags | AArch64II::MO_PAGEOFF |
-                                      AArch64II::MO_NC);
+                                      AArch64II::MO_NC | AArch64II::MO_GOT);
       }
 
       // If the LOADgot instruction has a debug-instr-number, annotate the

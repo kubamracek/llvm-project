@@ -813,6 +813,8 @@ void AArch64PassConfig::addMachineSSAOptimization() {
     addPass(createAArch64MIPeepholeOptPass());
 }
 
+namespace llvm { FunctionPass *createAArch64GOTRewrite(); }
+
 bool AArch64PassConfig::addILPOpts() {
   if (EnableCondOpt)
     addPass(createAArch64ConditionOptimizerPass());
@@ -822,6 +824,7 @@ bool AArch64PassConfig::addILPOpts() {
     addPass(&MachineCombinerID);
   if (EnableCondBrTuning)
     addPass(createAArch64CondBrTuning());
+  addPass(createAArch64GOTRewrite());
   if (EnableEarlyIfConversion)
     addPass(&EarlyIfConverterLegacyID);
   if (EnableStPairSuppress)
