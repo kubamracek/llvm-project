@@ -334,6 +334,9 @@ FunctionPass *llvm::createAArch64CondBrTuning() {
 
 
 
+#include "llvm/CodeGen/MachineDominators.h"
+#include "llvm/CodeGen/MachineLoopInfo.h"
+#include "llvm/InitializePasses.h"
 
 namespace llvm { FunctionPass *createAArch64GOTRewrite(); }
 namespace llvm { void initializeAArch64GOTRewritePass(PassRegistry &); }
@@ -348,8 +351,14 @@ namespace llvm { void initializeAArch64GOTRewritePass(PassRegistry &); }
 #define AARCH64_GOT_REWRITE_NAME "AArch64 GOT Rewrite"
 //#define LLVM_DEBUG(x) x
 
-// Stress testing mode - disable heuristics.
-static cl::opt<bool> EnableGOTRewrite("enable-got-rewrite", cl::Hidden);
+
+enum GOTRewriteMode { Disabled, All, InLoops };
+static cl::opt<GOTRewriteMode> GOTRewrite(
+    "got-rewrite", cl::Hidden,
+    cl::values(clEnumValN(Disabled, "disabled", "disabled"),
+               clEnumValN(All, "all", "all"),
+               clEnumValN(InLoops, "inloops", "inloops")),
+    cl::init(Disabled));
 
 namespace {
 class AArch64GOTRewrite : public MachineFunctionPass {
@@ -372,11 +381,15 @@ private:
 
 char AArch64GOTRewrite::ID = 0;
 
-INITIALIZE_PASS(AArch64GOTRewrite, "aarch64-got-rewrite",
-                AARCH64_GOT_REWRITE_NAME, false, false)
+INITIALIZE_PASS_BEGIN(AArch64GOTRewrite, "aarch64-got-rewrite",
+                      AARCH64_GOT_REWRITE_NAME, false, false)
+INITIALIZE_PASS_DEPENDENCY(MachineLoopInfoWrapperPass)
+INITIALIZE_PASS_END(AArch64GOTRewrite, "aarch64-got-rewrite",
+                    AARCH64_GOT_REWRITE_NAME, false, false)
 
 void AArch64GOTRewrite::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.setPreservesCFG();
+  AU.addRequired<MachineLoopInfoWrapperPass>();
   MachineFunctionPass::getAnalysisUsage(AU);
 }
 
@@ -395,6 +408,7 @@ static const char *GOTCallWhitelist[] = {
   "log2",
   "memmove",
   "_platform_bzero",
+  "bzero",
   "atan2f",
   "malloc_type_malloc",
   "memcmp",
@@ -405,6 +419,7 @@ static const char *GOTCallWhitelist[] = {
   "strlen",
   "memchr",
   "_platform_strcmp",
+  "strcmp",
   "strcmp",
   "mkdtempat_np",
   "pthread_mutex_unlock",
@@ -432,6 +447,7 @@ static const char *GOTCallWhitelist[] = {
   "malloc_type_aligned_alloc",
   "_ZnwmSt11align_val_t",
   "_platform_memmove",
+  "memmove",
   "atoi",
   "sigprocmask",
   "os_unfair_lock_unlock",
@@ -467,6 +483,7 @@ static const char *GOTCallWhitelist[] = {
   "__error",
   "sin",
   "_platform_memset",
+  "memset",
   "_ZNSt3__113basic_ostreamIcNS_11char_tr",
   "_ZNSt3__113basic_ostreamIcNS_11char_tr",
   "catgets",
@@ -523,6 +540,7 @@ static const char *GOTCallWhitelist[] = {
   "mmap",
   "fegetenv",
   "_platform_strncmp",
+  "strncmp",
   "__sysctl",
   "strncmp",
   "munmap",
@@ -649,36 +667,61 @@ bool AArch64GOTRewrite::convertBLToGOTCall(MachineInstr &MI) {
     // Check if this is a global with one of the whitelisted names
     const GlobalValue *GV = CalleeOp.getGlobal();
     if (GV && GV->hasName()) {
-      StringRef Name = GV->getName();
-      for (const char *WhitelistedName : GOTCallWhitelist) {
-        if (Name == WhitelistedName) {
-          SymbolName = GV->getName().data();
-          LLVM_DEBUG(dbgs() << "    Calling global function: " << SymbolName << "\n");
-          break;
-        }
-      }
+      SymbolName = GV->getName().data();
     }
   }
 
   if (!SymbolName) {
-    LLVM_DEBUG(dbgs() << "    Not a symbol or whitelisted global\n");
+    LLVM_DEBUG(dbgs() << "    No name\n");
     return false;
   }
 
+  bool Whitelisted = false;
+  for (const char *WhitelistedName : GOTCallWhitelist) {
+    if (StringRef(SymbolName) == WhitelistedName) {
+      Whitelisted  = true;
+      LLVM_DEBUG(dbgs() << "    Calling global function: " << SymbolName << "\n");
+      break;
+    }
+  }
+
+  if (!Whitelisted) {
+    LLVM_DEBUG(dbgs() << "    Not whitelisted\n");
+    return false;
+  }
+
+  MachineBasicBlock *MBB = MI.getParent();
+
+  // Check the GOTRewrite mode setting
+  if (GOTRewrite == Disabled) {
+    LLVM_DEBUG(dbgs() << "    GOT rewrite disabled, skipping\n");
+    return false;
+  }
+
+  if (GOTRewrite == InLoops) {
+    // Check if the basic block is part of a loop using MachineLoopInfo
+    MachineLoop *L = getAnalysis<MachineLoopInfoWrapperPass>().getLI().getLoopFor(MBB);
+
+    if (!L) {
+      LLVM_DEBUG(dbgs() << "    Not in a loop, skipping\n");
+      return false;
+    }
+  }
+  // If GOTRewrite == All, we proceed without loop check
+
   LLVM_DEBUG(dbgs() << "    Converting to GOT-based call\n");
 
-  MachineBasicBlock &MBB = *MI.getParent();
   DebugLoc DL = MI.getDebugLoc();
 
   // Create a virtual register to hold the function address
   Register FuncAddrReg = MRI->createVirtualRegister(&AArch64::GPR64RegClass);
 
   // Create LOADgot pseudo-instruction to load the function address from GOT
-  BuildMI(MBB, MI, DL, TII->get(AArch64::LOADgot), FuncAddrReg)
+  BuildMI(*MBB, MI, DL, TII->get(AArch64::LOADgot), FuncAddrReg)
       .addExternalSymbol(SymbolName);
 
   // Create BLR instruction to call through the register
-  MachineInstrBuilder BLR = BuildMI(MBB, MI, DL, TII->get(AArch64::BLR))
+  MachineInstrBuilder BLR = BuildMI(*MBB, MI, DL, TII->get(AArch64::BLR))
       .addReg(FuncAddrReg);
 
   // Copy over implicit operands (like implicit defs/uses)
@@ -692,8 +735,8 @@ bool AArch64GOTRewrite::convertBLToGOTCall(MachineInstr &MI) {
 }
 
 bool AArch64GOTRewrite::runOnMachineFunction(MachineFunction &MF) {
-  if (!EnableGOTRewrite || skipFunction(MF.getFunction()))
-    return false;
+    if (GOTRewrite == Disabled || skipFunction(MF.getFunction()))
+      return false;
 
   LLVM_DEBUG(
       dbgs() << "********** AArch64 GOT Rewrite **********\n"
