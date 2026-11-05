@@ -1889,7 +1889,7 @@ ValueLatticeElement LazyValueInfoImpl::getValueAtUse(const Use &U) {
   // position where V can be constrained by a select or branch condition.
   const Use *CurrU = &U;
   // TODO: Increase limit?
-  const unsigned MaxUsesToInspect = 4;
+  const unsigned MaxUsesToInspect = 5;
   for (unsigned I = 0; I < MaxUsesToInspect; ++I) {
     std::optional<ValueLatticeElement> CondVal;
     auto *CurrI = cast<Instruction>(CurrU->getUser());
