@@ -58,6 +58,11 @@ namespace llvm {
 extern cl::opt<bool> ProfcheckDisableMetadataFixes;
 }
 
+static cl::opt<bool> EnableSelectArmImpliedMinMax(
+    "instcombine-select-arm-implied-minmax", cl::init(false), cl::Hidden,
+    cl::desc("Simplify min/max intrinsics inside a select arm using the "
+             "select condition"));
+
 /// Replace a select operand based on an equality comparison with the identity
 /// constant of a binop.
 static Instruction *foldSelectBinOpIdentity(SelectInst &Sel,
@@ -1724,6 +1729,7 @@ bool InstCombinerImpl::replaceInInstruction(Value *V, Value *Old, Value *New,
   assert(!isa<Constant>(Old) && "Only replace non-constant values");
 
   auto *I = dyn_cast<Instruction>(V);
+  // FIXME: This should have IgnoreUBImplyingAttrs = false
   if (!I || !I->hasOneUse() ||
       !isSafeToSpeculativelyExecuteWithVariableReplaced(I))
     return false;
@@ -1740,6 +1746,65 @@ bool InstCombinerImpl::replaceInInstruction(Value *V, Value *Old, Value *New,
       Changed = true;
     } else {
       Changed |= replaceInInstruction(U, Old, New, Depth + 1);
+    }
+  }
+  return Changed;
+}
+
+/// Is there a min/max inside a select that's implied by the select's choice?
+/// If yes, replace it:
+///
+///     select (m < 0), (shl x, (sub 0, smin(m, 0))), 0
+/// --> select (m < 0), (shl x, (sub 0, m)), 0
+bool InstCombinerImpl::replaceImpliedMinMax(Value *V, SelectInst &Sel,
+                                            bool CondIsTrue, unsigned Depth) {
+  // Conservatively limit replacement to two instructions upwards.
+  if (Depth == 2)
+    return false;
+
+  auto *I = dyn_cast<Instruction>(V);
+  // FIXME: This should have IgnoreUBImplyingAttrs = false
+  if (!I || !I->hasOneUse() ||
+      !isSafeToSpeculativelyExecuteWithVariableReplaced(I))
+    return false;
+
+  // Forbid potentially lane-crossing instructions.
+  Value *Cond = Sel.getCondition();
+  if (Cond->getType()->isVectorTy() && !isNotCrossLaneOperation(I))
+    return false;
+
+  // If Op is a min/max whose result is implied by the select condition, return
+  // the operand it picks (otherwise nullptr):
+  //
+  // select (m < 0), (shl x, (sub 0, smin(m, 0))), 0
+  //                                      ^
+  auto GetImpliedOp = [&](Value *Op) -> Value * {
+    auto *MM = dyn_cast<MinMaxIntrinsic>(Op);
+    if (!MM)
+      return nullptr;
+
+    std::optional<bool> Implied = isImpliedCondition(
+        Cond, MM->getPredicate(), MM->getLHS(), MM->getRHS(), DL, CondIsTrue);
+    if (!Implied)
+      return nullptr;
+    Value *New = *Implied ? MM->getLHS() : MM->getRHS();
+
+    // Each use of an undef value may observe a different value, and the
+    // fold relies on Cond and New seeing the same one.
+    if (!isGuaranteedNotToBeUndef(New, SQ.AC, &Sel, &DT))
+      return nullptr;
+
+    return New;
+  };
+
+  bool Changed = false;
+  for (Use &U : I->operands()) {
+    if (Value *New = GetImpliedOp(U)) {
+      replaceUse(U, New);
+      Worklist.add(I);
+      Changed = true;
+    } else {
+      Changed |= replaceImpliedMinMax(U, Sel, CondIsTrue, Depth + 1);
     }
   }
   return Changed;
@@ -5032,6 +5097,12 @@ Instruction *InstCombinerImpl::visitSelectInst(SelectInst &SI) {
   if (CmpInst *CI = dyn_cast<CmpInst>(CondVal))
     if (Instruction *NewSel = foldSelectValueEquivalence(SI, *CI))
       return NewSel;
+
+  // Simplify min/max in an arm using what the condition implies.
+  if (EnableSelectArmImpliedMinMax &&
+      (replaceImpliedMinMax(TrueVal, SI, /*CondIsTrue=*/true) ||
+       replaceImpliedMinMax(FalseVal, SI, /*CondIsTrue=*/false)))
+    return &SI;
 
   if (ICmpInst *ICI = dyn_cast<ICmpInst>(CondVal))
     if (Instruction *Result = foldSelectInstWithICmp(SI, ICI))

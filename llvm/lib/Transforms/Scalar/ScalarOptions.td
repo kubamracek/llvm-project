@@ -39,6 +39,10 @@ defm : BoolField<"constraint-elimination-dump-reproducers", "false",
 defm : ValueField<"constraint-elimination-max-rows", "unsigned", "500",
   "Maximum number of rows to keep in constraint system">;
 
+// CorrelatedValuePropagation.cpp
+defm : BoolField<"cvp-freeze-for-select-conditions", "false",
+  "Allow folds to use a select condition that may be undef, by freezing the value it constrains">;
+
 // DeadStoreElimination.cpp
 defm : ValueField<"dse-max-dom-cond-depth", "unsigned", "1024",
   "Max dominator tree recursion depth for eliminating redundant stores via dominating conditions">;

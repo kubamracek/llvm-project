@@ -855,6 +855,8 @@ public:
 
   bool replaceInInstruction(Value *V, Value *Old, Value *New,
                             unsigned Depth = 0);
+  bool replaceImpliedMinMax(Value *V, SelectInst &Sel, bool CondIsTrue,
+                            unsigned Depth = 0);
 
   Value *insertRangeTest(Value *V, const APInt &Lo, const APInt &Hi,
                          bool isSigned, bool Inside);

@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/Scalar/CorrelatedValuePropagation.h"
+#include "ScalarOptions.h"
 #include "llvm/ADT/DepthFirstIterator.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
@@ -88,6 +89,8 @@ STATISTIC(NumSaturating,
 STATISTIC(NumNonNull, "Number of function pointer arguments marked non-null");
 STATISTIC(NumCmpIntr, "Number of llvm.[us]cmp intrinsics removed");
 STATISTIC(NumMinMax, "Number of llvm.[us]{min,max} intrinsics removed");
+STATISTIC(NumFrozen, "Number of values frozen to make use of a select "
+                     "condition that may be undef");
 STATISTIC(NumSMinMax,
           "Number of llvm.s{min,max} intrinsics simplified to unsigned");
 STATISTIC(NumUDivURemsNarrowedExpanded,
@@ -103,11 +106,18 @@ class CVPImpl {
   DominatorTree *DT;
   const SimplifyQuery SQ;
   std::optional<ConstantRange> RetRange;
+  // Whether values may be frozen so that a select condition that may be undef
+  // can be used at a use (see getRangeAtUseIfFrozen). Freezing marks a value as
+  // initialized for MemorySanitizer, so don't hide uses of uninitialized values
+  // from it.
+  const bool AllowFreeze;
 
 public:
   CVPImpl(Function &F, LazyValueInfo *LVI, DominatorTree *DT,
           const SimplifyQuery &SQ)
-      : F(F), LVI(LVI), DT(DT), SQ(SQ) {}
+      : F(F), LVI(LVI), DT(DT), SQ(SQ),
+        AllowFreeze(getScalarOptions(F).cvp_freeze_for_select_conditions &&
+                    !F.hasFnAttribute(Attribute::SanitizeMemory)) {}
 
   bool run();
 
@@ -131,9 +141,9 @@ private:
   bool processCallSite(CallBase &CB);
   bool processUDivOrURem(BinaryOperator *Instr);
   bool processSRem(BinaryOperator *SDI, const ConstantRange &LCR,
-                   const ConstantRange &RCR);
+                   const ConstantRange &RCR, function_ref<bool()> BeforeChange);
   bool processSDiv(BinaryOperator *SDI, const ConstantRange &LCR,
-                   const ConstantRange &RCR);
+                   const ConstantRange &RCR, function_ref<bool()> BeforeChange);
   bool processSDivOrSRem(BinaryOperator *Instr);
   bool processAShr(BinaryOperator *SDI);
   bool processSExt(SExtInst *SDI);
@@ -147,7 +157,11 @@ private:
   Constant *getConstantAt(Value *V, Instruction *At);
   bool simplifyCommonValuePhi(PHINode *P);
   bool constantFoldCmp(CmpInst *Cmp);
-  bool willNotOverflow(BinaryOpIntrinsic *BO);
+  bool willNotOverflow(BinaryOpIntrinsic *BO,
+                       SmallVectorImpl<Value *> &NeedsFreeze);
+  ConstantRange getRangeAtUseIfFrozen(const Use &U, bool UndefAllowed,
+                                      SmallVectorImpl<Value *> &NeedsFreeze);
+  bool commitFreezes(SmallVectorImpl<Value *> &NeedsFreeze);
   Value *getValueOnEdge(Value *Incoming, BasicBlock *From, BasicBlock *To,
                         Instruction *CtxI);
   NoWrapFlags inferNoWrapFromUses(BinaryOperator *BinOp, bool WantNSW,
@@ -522,11 +536,12 @@ bool CVPImpl::processSwitch(SwitchInst *I) {
 }
 
 // See if we can prove that the given binary op intrinsic will not overflow.
-bool CVPImpl::willNotOverflow(BinaryOpIntrinsic *BO) {
-  ConstantRange LRange =
-      LVI->getConstantRangeAtUse(BO->getOperandUse(0), /*UndefAllowed*/ false);
-  ConstantRange RRange =
-      LVI->getConstantRangeAtUse(BO->getOperandUse(1), /*UndefAllowed*/ false);
+bool CVPImpl::willNotOverflow(BinaryOpIntrinsic *BO,
+                              SmallVectorImpl<Value *> &NeedsFreeze) {
+  ConstantRange LRange = getRangeAtUseIfFrozen(
+      BO->getOperandUse(0), /*UndefAllowed*/ false, NeedsFreeze);
+  ConstantRange RRange = getRangeAtUseIfFrozen(
+      BO->getOperandUse(1), /*UndefAllowed*/ false, NeedsFreeze);
   ConstantRange NWRegion = ConstantRange::makeGuaranteedNoWrapRegion(
       BO->getBinaryOp(), RRange, BO->getNoWrapKind());
   return NWRegion.contains(LRange);
@@ -586,21 +601,22 @@ bool CVPImpl::processAbsIntrinsic(IntrinsicInst *II) {
   Value *X = II->getArgOperand(0);
   bool IsIntMinPoison = cast<ConstantInt>(II->getArgOperand(1))->isOne();
   APInt IntMin = APInt::getSignedMinValue(X->getType()->getScalarSizeInBits());
-  ConstantRange Range = LVI->getConstantRangeAtUse(
-      II->getOperandUse(0), /*UndefAllowed*/ IsIntMinPoison);
+  SmallVector<Value *, 1> NeedsFreeze;
+  ConstantRange Range = getRangeAtUseIfFrozen(
+      II->getOperandUse(0), /*UndefAllowed*/ IsIntMinPoison, NeedsFreeze);
 
   // Is X in [0, IntMin]?  NOTE: INT_MIN is fine!
-  if (Range.icmp(CmpInst::ICMP_ULE, IntMin)) {
+  if (Range.icmp(CmpInst::ICMP_ULE, IntMin) && commitFreezes(NeedsFreeze)) {
     ++NumAbs;
-    II->replaceAllUsesWith(X);
+    II->replaceAllUsesWith(II->getArgOperand(0));
     II->eraseFromParent();
     return true;
   }
 
   // Is X in [IntMin, 0]?  NOTE: INT_MIN is fine!
-  if (Range.getSignedMax().isNonPositive()) {
+  if (Range.getSignedMax().isNonPositive() && commitFreezes(NeedsFreeze)) {
     IRBuilder<> B(II);
-    Value *NegX = B.CreateNeg(X, II->getName(),
+    Value *NegX = B.CreateNeg(II->getArgOperand(0), II->getName(),
                               /*HasNSW=*/IsIntMinPoison);
     ++NumAbs;
     II->replaceAllUsesWith(NegX);
@@ -614,7 +630,11 @@ bool CVPImpl::processAbsIntrinsic(IntrinsicInst *II) {
   }
 
   // Argument's range crosses zero.
-  // Can we at least tell that the argument is never INT_MIN?
+  // Can we at least tell that the argument is never INT_MIN? Only infer the
+  // flag from a range that doesn't need freezing.
+  if (!NeedsFreeze.empty())
+    Range = LVI->getConstantRangeAtUse(II->getOperandUse(0),
+                                       /*UndefAllowed*/ IsIntMinPoison);
   if (!IsIntMinPoison && !Range.contains(IntMin)) {
     ++NumNSW;
     ++NumSubNSW;
@@ -652,27 +672,87 @@ bool CVPImpl::processCmpIntrinsic(CmpIntrinsic *CI) {
   return false;
 }
 
+// Where to insert a freeze of V that dominates all uses of V, if possible.
+static std::optional<BasicBlock::iterator> getFreezeInsertPt(Value *V) {
+  if (auto *A = dyn_cast<Argument>(V))
+    return A->getParent()->getEntryBlock().getFirstNonPHIOrAlloca();
+  if (auto *I = dyn_cast<Instruction>(V))
+    // Fails for callbr results, which are available in multiple successors.
+    // For invoke results, phi uses in the normal destination stay unfrozen,
+    // but uses that need to agree with each other are dominated by the freeze.
+    return I->getInsertionPointAfterDef();
+  return std::nullopt;
+}
+
+// Freeze V right after its definition and make every use it dominates read the
+// frozen value, so that all of them observe the same value even if V is undef.
+static void freezeAllUses(Value *V, BasicBlock::iterator InsertPt,
+                          DominatorTree &DT) {
+  InsertPt.setHeadBit(false);
+  auto *FI = new FreezeInst(V, V->getName() + ".fr", InsertPt);
+  V->replaceUsesWithIf(
+      FI, [&](Use &U) { return U.getUser() != FI && DT.dominates(FI, U); });
+}
+
+// The range of U's value at U. If freezing is allowed, this may use select
+// conditions that may be undef: the values whose freeze that requires are added
+// to NeedsFreeze, and commitFreezes() must succeed before changing the IR based
+// on the range in a way that reads one of those values.
+ConstantRange
+CVPImpl::getRangeAtUseIfFrozen(const Use &U, bool UndefAllowed,
+                               SmallVectorImpl<Value *> &NeedsFreeze) {
+  return LVI->getConstantRangeAtUse(U, UndefAllowed,
+                                    AllowFreeze ? &NeedsFreeze : nullptr);
+}
+
+// Freeze all values in NeedsFreeze, or none if one of them can't be frozen.
+bool CVPImpl::commitFreezes(SmallVectorImpl<Value *> &NeedsFreeze) {
+  if (!all_of(NeedsFreeze,
+              [](Value *V) { return getFreezeInsertPt(V).has_value(); }))
+    return false;
+  for (Value *V : NeedsFreeze) {
+    freezeAllUses(V, *getFreezeInsertPt(V), *DT);
+    ++NumFrozen;
+  }
+  NeedsFreeze.clear();
+  return true;
+}
+
 // See if this min/max intrinsic always picks it's one specific operand.
 // If not, check whether we can canonicalize signed minmax into unsigned version
 bool CVPImpl::processMinMaxIntrinsic(MinMaxIntrinsic *MM) {
   CmpInst::Predicate Pred = CmpInst::getNonStrictPredicate(MM->getPredicate());
-  ConstantRange LRange = LVI->getConstantRangeAtUse(MM->getOperandUse(0),
-                                                    /*UndefAllowed*/ false);
-  ConstantRange RRange = LVI->getConstantRangeAtUse(MM->getOperandUse(1),
-                                                    /*UndefAllowed*/ false);
-  if (LRange.icmp(Pred, RRange)) {
-    ++NumMinMax;
-    MM->replaceAllUsesWith(MM->getLHS());
-    MM->eraseFromParent();
-    return true;
-  }
-  if (RRange.icmp(Pred, LRange)) {
-    ++NumMinMax;
-    MM->replaceAllUsesWith(MM->getRHS());
-    MM->eraseFromParent();
-    return true;
+  // A select condition that may be undef still constrains an operand if the
+  // operand is frozen, so that the condition and the min/max observe the same
+  // value:
+  //   select (m < 0), (shl x, (sub 0, smin(m, 0))), 0
+  //     --> m.fr = freeze m
+  //         select (m.fr < 0), (shl x, (sub 0, m.fr)), 0
+  // A constant result doesn't read the operands, so it needs no freeze.
+  SmallVector<Value *, 2> NeedsFreeze;
+  ConstantRange LRange = getRangeAtUseIfFrozen(
+      MM->getOperandUse(0), /*UndefAllowed*/ false, NeedsFreeze);
+  ConstantRange RRange = getRangeAtUseIfFrozen(
+      MM->getOperandUse(1), /*UndefAllowed*/ false, NeedsFreeze);
+  for (unsigned OpNo : {0, 1}) {
+    const ConstantRange &PickedRange = OpNo == 0 ? LRange : RRange;
+    const ConstantRange &OtherRange = OpNo == 0 ? RRange : LRange;
+    if (PickedRange.icmp(Pred, OtherRange) &&
+        (isa<Constant>(MM->getOperand(OpNo)) || commitFreezes(NeedsFreeze))) {
+      ++NumMinMax;
+      MM->replaceAllUsesWith(MM->getOperand(OpNo));
+      MM->eraseFromParent();
+      return true;
+    }
   }
 
+  // Only canonicalize based on ranges that don't need freezing.
+  if (!NeedsFreeze.empty()) {
+    LRange = LVI->getConstantRangeAtUse(MM->getOperandUse(0),
+                                        /*UndefAllowed*/ false);
+    RRange = LVI->getConstantRangeAtUse(MM->getOperandUse(1),
+                                        /*UndefAllowed*/ false);
+  }
   if (MM->isSigned() &&
       ConstantRange::areInsensitiveToSignednessOfICmpPredicate(LRange,
                                                                RRange)) {
@@ -751,12 +831,14 @@ bool CVPImpl::processCallSite(CallBase &CB) {
   }
 
   if (auto *WO = dyn_cast<WithOverflowInst>(&CB)) {
-    if (willNotOverflow(WO))
+    SmallVector<Value *, 2> NeedsFreeze;
+    if (willNotOverflow(WO, NeedsFreeze) && commitFreezes(NeedsFreeze))
       return processOverflowIntrinsic(WO);
   }
 
   if (auto *SI = dyn_cast<SaturatingInst>(&CB)) {
-    if (willNotOverflow(SI))
+    SmallVector<Value *, 2> NeedsFreeze;
+    if (willNotOverflow(SI, NeedsFreeze) && commitFreezes(NeedsFreeze))
       return processSaturatingInst(SI);
   }
 
@@ -829,7 +911,8 @@ static Domain getDomain(const ConstantRange &CR) {
 /// Try to shrink a sdiv/srem's width down to the smallest power of two that's
 /// sufficient to contain its operands.
 static bool narrowSDivOrSRem(BinaryOperator *Instr, const ConstantRange &LCR,
-                             const ConstantRange &RCR) {
+                             const ConstantRange &RCR,
+                             function_ref<bool()> BeforeChange) {
   assert(Instr->getOpcode() == Instruction::SDiv ||
          Instr->getOpcode() == Instruction::SRem);
 
@@ -853,7 +936,7 @@ static bool narrowSDivOrSRem(BinaryOperator *Instr, const ConstantRange &LCR,
 
   // NewWidth might be greater than OrigWidth if OrigWidth is not a power of
   // two.
-  if (NewWidth >= OrigWidth)
+  if (NewWidth >= OrigWidth || !BeforeChange())
     return false;
 
   ++NumSDivSRemsNarrowed;
@@ -875,20 +958,20 @@ static bool narrowSDivOrSRem(BinaryOperator *Instr, const ConstantRange &LCR,
 }
 
 static bool expandUDivOrURem(BinaryOperator *Instr, const ConstantRange &XCR,
-                             const ConstantRange &YCR) {
+                             const ConstantRange &YCR,
+                             function_ref<bool()> BeforeChange) {
   Type *Ty = Instr->getType();
   assert(Instr->getOpcode() == Instruction::UDiv ||
          Instr->getOpcode() == Instruction::URem);
   bool IsRem = Instr->getOpcode() == Instruction::URem;
 
-  Value *X = Instr->getOperand(0);
-  Value *Y = Instr->getOperand(1);
-
   // X u/ Y -> 0  iff X u< Y
   // X u% Y -> X  iff X u< Y
-  if (XCR.icmp(ICmpInst::ICMP_ULT, YCR)) {
+  // The constant result of the udiv doesn't read X, so it needs no freeze.
+  if (XCR.icmp(ICmpInst::ICMP_ULT, YCR) && (!IsRem || BeforeChange())) {
     salvageDebugInfo(*Instr);
-    Instr->replaceAllUsesWith(IsRem ? X : Constant::getNullValue(Ty));
+    Instr->replaceAllUsesWith(IsRem ? Instr->getOperand(0)
+                                    : Constant::getNullValue(Ty));
     Instr->eraseFromParent();
     ++NumUDivURemsNarrowedExpanded;
     return true;
@@ -920,6 +1003,11 @@ static bool expandUDivOrURem(BinaryOperator *Instr, const ConstantRange &XCR,
   // be 2x larger than that. I.e. if divisor is always negative.
   if (!XCR.icmp(ICmpInst::ICMP_ULT, YCR.uadd_sat(YCR)) && !YCR.isAllNegative())
     return false;
+
+  if (!BeforeChange())
+    return false;
+  Value *X = Instr->getOperand(0);
+  Value *Y = Instr->getOperand(1);
 
   IRBuilder<> B(Instr);
   Value *ExpandedOp;
@@ -958,7 +1046,8 @@ static bool expandUDivOrURem(BinaryOperator *Instr, const ConstantRange &XCR,
 /// Try to shrink a udiv/urem's width down to the smallest power of two that's
 /// sufficient to contain its operands.
 static bool narrowUDivOrURem(BinaryOperator *Instr, const ConstantRange &XCR,
-                             const ConstantRange &YCR) {
+                             const ConstantRange &YCR,
+                             function_ref<bool()> BeforeChange) {
   assert(Instr->getOpcode() == Instruction::UDiv ||
          Instr->getOpcode() == Instruction::URem);
 
@@ -973,7 +1062,7 @@ static bool narrowUDivOrURem(BinaryOperator *Instr, const ConstantRange &XCR,
 
   // NewWidth might be greater than OrigWidth if OrigWidth is not a power of
   // two.
-  if (NewWidth >= Instr->getType()->getScalarSizeInBits())
+  if (NewWidth >= Instr->getType()->getScalarSizeInBits() || !BeforeChange())
     return false;
 
   ++NumUDivURemsNarrowed;
@@ -997,22 +1086,25 @@ static bool narrowUDivOrURem(BinaryOperator *Instr, const ConstantRange &XCR,
 bool CVPImpl::processUDivOrURem(BinaryOperator *Instr) {
   assert(Instr->getOpcode() == Instruction::UDiv ||
          Instr->getOpcode() == Instruction::URem);
-  ConstantRange XCR = LVI->getConstantRangeAtUse(Instr->getOperandUse(0),
-                                                 /*UndefAllowed*/ false);
+  SmallVector<Value *, 2> NeedsFreeze;
+  ConstantRange XCR = getRangeAtUseIfFrozen(
+      Instr->getOperandUse(0), /*UndefAllowed*/ false, NeedsFreeze);
   // Allow undef for RHS, as we can assume it is division by zero UB.
-  ConstantRange YCR = LVI->getConstantRangeAtUse(Instr->getOperandUse(1),
-                                                 /*UndefAllowed*/ true);
-  if (expandUDivOrURem(Instr, XCR, YCR))
+  ConstantRange YCR = getRangeAtUseIfFrozen(Instr->getOperandUse(1),
+                                            /*UndefAllowed*/ true, NeedsFreeze);
+  auto BeforeChange = [&]() { return commitFreezes(NeedsFreeze); };
+  if (expandUDivOrURem(Instr, XCR, YCR, BeforeChange))
     return true;
 
-  return narrowUDivOrURem(Instr, XCR, YCR);
+  return narrowUDivOrURem(Instr, XCR, YCR, BeforeChange);
 }
 
 bool CVPImpl::processSRem(BinaryOperator *SDI, const ConstantRange &LCR,
-                          const ConstantRange &RCR) {
+                          const ConstantRange &RCR,
+                          function_ref<bool()> BeforeChange) {
   assert(SDI->getOpcode() == Instruction::SRem);
 
-  if (LCR.abs().icmp(CmpInst::ICMP_ULT, RCR.abs())) {
+  if (LCR.abs().icmp(CmpInst::ICMP_ULT, RCR.abs()) && BeforeChange()) {
     salvageDebugInfo(*SDI);
     SDI->replaceAllUsesWith(SDI->getOperand(0));
     SDI->eraseFromParent();
@@ -1023,10 +1115,11 @@ bool CVPImpl::processSRem(BinaryOperator *SDI, const ConstantRange &LCR,
     Value *V;
     Domain D;
   };
-  std::array<Operand, 2> Ops = {{{SDI->getOperand(0), getDomain(LCR)},
-                                 {SDI->getOperand(1), getDomain(RCR)}}};
-  if (Ops[0].D == Domain::Unknown || Ops[1].D == Domain::Unknown)
+  Domain LD = getDomain(LCR), RD = getDomain(RCR);
+  if (LD == Domain::Unknown || RD == Domain::Unknown || !BeforeChange())
     return false;
+  std::array<Operand, 2> Ops = {
+      {{SDI->getOperand(0), LD}, {SDI->getOperand(1), RD}}};
 
   // We know domains of both of the operands!
   ++NumSRems;
@@ -1070,10 +1163,12 @@ bool CVPImpl::processSRem(BinaryOperator *SDI, const ConstantRange &LCR,
 /// conditions, this can sometimes prove conditions instcombine can't by
 /// exploiting range information.
 bool CVPImpl::processSDiv(BinaryOperator *SDI, const ConstantRange &LCR,
-                          const ConstantRange &RCR) {
+                          const ConstantRange &RCR,
+                          function_ref<bool()> BeforeChange) {
   assert(SDI->getOpcode() == Instruction::SDiv);
 
-  // Check whether the division folds to a constant.
+  // Check whether the division folds to a constant. The constant doesn't read
+  // the operands, so it needs no freeze.
   ConstantRange DivCR = LCR.sdiv(RCR);
   if (const APInt *Elem = DivCR.getSingleElement()) {
     salvageDebugInfo(*SDI);
@@ -1086,10 +1181,11 @@ bool CVPImpl::processSDiv(BinaryOperator *SDI, const ConstantRange &LCR,
     Value *V;
     Domain D;
   };
-  std::array<Operand, 2> Ops = {{{SDI->getOperand(0), getDomain(LCR)},
-                                 {SDI->getOperand(1), getDomain(RCR)}}};
-  if (Ops[0].D == Domain::Unknown || Ops[1].D == Domain::Unknown)
+  Domain LD = getDomain(LCR), RD = getDomain(RCR);
+  if (LD == Domain::Unknown || RD == Domain::Unknown || !BeforeChange())
     return false;
+  std::array<Operand, 2> Ops = {
+      {{SDI->getOperand(0), LD}, {SDI->getOperand(1), RD}}};
 
   // We know domains of both of the operands!
   ++NumSDivs;
@@ -1131,21 +1227,23 @@ bool CVPImpl::processSDiv(BinaryOperator *SDI, const ConstantRange &LCR,
 bool CVPImpl::processSDivOrSRem(BinaryOperator *Instr) {
   assert(Instr->getOpcode() == Instruction::SDiv ||
          Instr->getOpcode() == Instruction::SRem);
-  ConstantRange LCR =
-      LVI->getConstantRangeAtUse(Instr->getOperandUse(0), /*AllowUndef*/ false);
+  SmallVector<Value *, 2> NeedsFreeze;
+  ConstantRange LCR = getRangeAtUseIfFrozen(Instr->getOperandUse(0),
+                                            /*AllowUndef*/ false, NeedsFreeze);
   // Allow undef for RHS, as we can assume it is division by zero UB.
-  ConstantRange RCR =
-      LVI->getConstantRangeAtUse(Instr->getOperandUse(1), /*AlloweUndef*/ true);
+  ConstantRange RCR = getRangeAtUseIfFrozen(Instr->getOperandUse(1),
+                                            /*AlloweUndef*/ true, NeedsFreeze);
+  auto BeforeChange = [&]() { return commitFreezes(NeedsFreeze); };
   if (Instr->getOpcode() == Instruction::SDiv)
-    if (processSDiv(Instr, LCR, RCR))
+    if (processSDiv(Instr, LCR, RCR, BeforeChange))
       return true;
 
   if (Instr->getOpcode() == Instruction::SRem) {
-    if (processSRem(Instr, LCR, RCR))
+    if (processSRem(Instr, LCR, RCR, BeforeChange))
       return true;
   }
 
-  return narrowSDivOrSRem(Instr, LCR, RCR);
+  return narrowSDivOrSRem(Instr, LCR, RCR, BeforeChange);
 }
 
 bool CVPImpl::processAShr(BinaryOperator *SDI) {
@@ -1340,9 +1438,10 @@ bool CVPImpl::processAnd(BinaryOperator *BinOp) {
 
   // We can only replace the AND with LHS based on range info if the range does
   // not include undef.
+  SmallVector<Value *, 1> NeedsFreeze;
   ConstantRange LRange =
-      LVI->getConstantRangeAtUse(LHS, /*UndefAllowed=*/false);
-  if (!LRange.getUnsignedMax().ule(*RHS))
+      getRangeAtUseIfFrozen(LHS, /*UndefAllowed=*/false, NeedsFreeze);
+  if (!LRange.getUnsignedMax().ule(*RHS) || !commitFreezes(NeedsFreeze))
     return false;
 
   salvageDebugInfo(*BinOp);

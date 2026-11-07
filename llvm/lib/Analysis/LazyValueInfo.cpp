@@ -492,7 +492,8 @@ public:
                                      BasicBlock *ToBB,
                                      Instruction *CtxI = nullptr);
 
-  ValueLatticeElement getValueAtUse(const Use &U);
+  ValueLatticeElement getValueAtUse(const Use &U,
+                                    SmallVectorImpl<Value *> *NeedsFreeze);
 
   /// Complete flush all previously computed values
   void clear() {
@@ -1881,7 +1882,9 @@ getValueOnEdge(Value *V, BasicBlock *FromBB, BasicBlock *ToBB,
   return *Result;
 }
 
-ValueLatticeElement LazyValueInfoImpl::getValueAtUse(const Use &U) {
+ValueLatticeElement
+LazyValueInfoImpl::getValueAtUse(const Use &U,
+                                 SmallVectorImpl<Value *> *NeedsFreeze) {
   Value *V = U.get();
   auto *CtxI = cast<Instruction>(U.getUser());
   ValueLatticeElement VL = getValueInBlock(V, CtxI->getParent(), CtxI);
@@ -1906,8 +1909,10 @@ ValueLatticeElement LazyValueInfoImpl::getValueAtUse(const Use &U) {
 
     if (auto *SI = dyn_cast<SelectInst>(CurrI)) {
       // If the value is undef, a different value may be chosen in
-      // the select condition and at use.
-      if (!isGuaranteedNotToBeUndef(SI->getCondition(), AC))
+      // the select condition and at use. The caller can avoid that by
+      // freezing V, if it asked for it.
+      bool MayBeUndef = !isGuaranteedNotToBeUndef(SI->getCondition(), AC);
+      if (MayBeUndef && (!NeedsFreeze || isa<Constant>(V)))
         break;
       if (CurrU->getOperandNo() == 1)
         CondVal =
@@ -1917,6 +1922,15 @@ ValueLatticeElement LazyValueInfoImpl::getValueAtUse(const Use &U) {
         CondVal =
             *getValueFromCondition(V, SI->getCondition(), /*IsTrueDest*/ false,
                                    /*UseBlockValue*/ false);
+      // Only ask for the freeze if the condition narrows the range.
+      if (MayBeUndef && CondVal) {
+        Type *Ty = V->getType();
+        if (VL.intersect(*CondVal).asConstantRange(Ty, /*UndefAllowed=*/true) ==
+            VL.asConstantRange(Ty, /*UndefAllowed=*/true))
+          CondVal.reset();
+        else if (!is_contained(*NeedsFreeze, V))
+          NeedsFreeze->push_back(V);
+      }
     } else if (auto *PHI = dyn_cast<PHINode>(CurrI)) {
       // TODO: Use non-local query?
       CondVal = *getEdgeValueLocal(V, PHI->getIncomingBlock(*CurrU),
@@ -2058,9 +2072,10 @@ ConstantRange LazyValueInfo::getConstantRange(Value *V, Instruction *CtxI,
   return Result.asConstantRange(V->getType(), UndefAllowed);
 }
 
-ConstantRange LazyValueInfo::getConstantRangeAtUse(const Use &U,
-                                                   bool UndefAllowed) {
-  ValueLatticeElement Result = getOrCreateImpl().getValueAtUse(U);
+ConstantRange
+LazyValueInfo::getConstantRangeAtUse(const Use &U, bool UndefAllowed,
+                                     SmallVectorImpl<Value *> *NeedsFreeze) {
+  ValueLatticeElement Result = getOrCreateImpl().getValueAtUse(U, NeedsFreeze);
   return Result.asConstantRange(U->getType(), UndefAllowed);
 }
 

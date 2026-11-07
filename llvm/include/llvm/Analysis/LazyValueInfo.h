@@ -96,8 +96,15 @@ namespace llvm {
 
     /// Return the ConstantRange constraint that is known to hold for the value
     /// at a specific use-site.
-    LLVM_ABI ConstantRange getConstantRangeAtUse(const Use &U,
-                                                 bool UndefAllowed);
+    ///
+    /// Constraining the value with a select condition requires that the
+    /// condition isn't undef, as otherwise the condition and the use may see
+    /// different values. If NeedsFreeze is non-null, such conditions are used
+    /// anyway and the value is added to NeedsFreeze: the returned range then
+    /// only holds once all uses of the value read the same freeze of it.
+    LLVM_ABI ConstantRange
+    getConstantRangeAtUse(const Use &U, bool UndefAllowed,
+                          SmallVectorImpl<Value *> *NeedsFreeze = nullptr);
 
     /// Determine whether the specified value is known to be a
     /// constant on the specified edge.  Return null if not.
