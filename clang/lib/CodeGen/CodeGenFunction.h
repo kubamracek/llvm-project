@@ -1577,6 +1577,10 @@ private:
   /// EmitGSBufferStackProtectorMD.
   bool MarkGSBuffers = false;
 
+  /// Whether clang classifies this function's allocas for basic
+  /// -fstack-protector.
+  bool MarkBasicSSPAllocas = false;
+
   /// IndirectBranch - The first time an indirect goto is seen we create a block
   /// with an indirect branch.  Every time we see the address of a label taken,
   /// we add the label to the indirect goto.  Every subsequent indirect goto is
@@ -3631,8 +3635,8 @@ public:
   /// \p IsLarge says the buffer should be laid out closest to the guard.
   void MarkGSBufferAlloca(llvm::AllocaInst *AI, bool IsLarge);
 
-  /// Under /GS, mark fixed-size allocas that aren't GS buffers as not buffers.
-  void EmitGSNonBufferStackProtectorMD();
+  /// Mark every unmarked alloca per the basic or /GS heuristic.
+  void EmitHeuristicStackProtectorMD();
 
   void EmitAutoVarInit(const AutoVarEmission &emission);
   void EmitAutoVarCleanups(const AutoVarEmission &emission);

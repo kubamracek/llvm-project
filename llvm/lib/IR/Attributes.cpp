@@ -2625,15 +2625,14 @@ static void adjustCallerSSPLevel(Function &Caller, const Function &Callee) {
   if (!Caller.hasStackProtectorFnAttr())
     return;
 
-  // TODO: Heuristic opt-outs (value 3) survive inlining across modes (e.g. /GS
-  // into strong), which can lose protection.
+  // TODO: Heuristic opt-outs (value 3) survive inlining across modes (/GS or
+  // basic into strong), which can lose protection.
 
   // If upgrading the SSP attribute, clear out the old SSP Attributes first.
   // Having multiple SSP attributes doesn't actually hurt, but it adds useless
   // clutter to the IR.
   AttributeMask OldSSPAttr;
-  OldSSPAttr.addAttribute(Attribute::StackProtect)
-      .addAttribute(Attribute::StackProtectStrong)
+  OldSSPAttr.addAttribute(Attribute::StackProtectStrong)
       .addAttribute(Attribute::StackProtectReq);
 
   if (Callee.hasFnAttribute(Attribute::StackProtectReq)) {
@@ -2643,10 +2642,7 @@ static void adjustCallerSSPLevel(Function &Caller, const Function &Callee) {
              !Caller.hasFnAttribute(Attribute::StackProtectReq)) {
     Caller.removeFnAttrs(OldSSPAttr);
     Caller.addFnAttr(Attribute::StackProtectStrong);
-  } else if (Callee.hasFnAttribute(Attribute::StackProtect) &&
-             !Caller.hasFnAttribute(Attribute::StackProtectReq) &&
-             !Caller.hasFnAttribute(Attribute::StackProtectStrong))
-    Caller.addFnAttr(Attribute::StackProtect);
+  }
 }
 
 /// If the inlined function required stack probes, then ensure that

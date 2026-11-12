@@ -1735,15 +1735,53 @@ void CodeGenFunction::MarkGSBufferAlloca(llvm::AllocaInst *AI, bool IsLarge) {
   AI->setMetadata("stack-protector", llvm::MDNode::get(Ctx, {Operand}));
 }
 
-void CodeGenFunction::EmitGSNonBufferStackProtectorMD() {
-  // 3 = not a buffer.
-  llvm::MDNode *NotABuffer = llvm::MDNode::get(
-      getLLVMContext(),
-      {llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(Int32Ty, 3))});
+/// Whether basic -fstack-protector protects an alloca of type \p Ty.
+/// TODO: Works on IR types, so struct padding still counts (#66709).
+static bool isBasicSSPBuffer(llvm::Type *Ty, const llvm::DataLayout &DL,
+                             bool IsDarwin, unsigned SSPBufferSize,
+                             bool InStruct) {
+  if (auto *AT = dyn_cast<llvm::ArrayType>(Ty)) {
+    if (!AT->getElementType()->isIntegerTy(8) && (InStruct || !IsDarwin))
+      return false;
+    return DL.getTypeAllocSize(AT).getFixedValue() >= SSPBufferSize;
+  }
+  if (auto *ST = dyn_cast<llvm::StructType>(Ty))
+    return llvm::any_of(ST->elements(), [&](llvm::Type *ElemTy) {
+      return isBasicSSPBuffer(ElemTy, DL, IsDarwin, SSPBufferSize,
+                              /*InStruct=*/true);
+    });
+  return false;
+}
+
+void CodeGenFunction::EmitHeuristicStackProtectorMD() {
+  const llvm::DataLayout &DL = CGM.getDataLayout();
+  bool IsDarwin = CGM.getTriple().isOSDarwin();
+  unsigned SSPBufferSize = CGM.getCodeGenOpts().SSPBufferSize;
+  llvm::LLVMContext &Ctx = getLLVMContext();
+
+  // TODO: ClangIR.
   for (llvm::Instruction &I : llvm::instructions(CurFn)) {
     auto *AI = dyn_cast<llvm::AllocaInst>(&I);
-    if (AI && !AI->isArrayAllocation() && !AI->getMetadata("stack-protector"))
-      AI->setMetadata("stack-protector", NotABuffer);
+    // Already classified, or an explicit opt-out.
+    if (!AI || AI->getMetadata("stack-protector"))
+      continue;
+
+    // Basic mode doesn't protect a small constant-size alloca call.
+    if (AI->isArrayAllocation()) {
+      const auto *Size = dyn_cast<llvm::ConstantInt>(AI->getArraySize());
+      if (MarkGSBuffers || !Size ||
+          Size->getLimitedValue(SSPBufferSize) >= SSPBufferSize)
+        continue;
+    }
+
+    // 2 = large buffer, 3 = not a buffer.
+    bool IsBuffer =
+        !MarkGSBuffers &&
+        isBasicSSPBuffer(AI->getAllocatedType(), DL, IsDarwin, SSPBufferSize,
+                         /*InStruct=*/false);
+    auto *Operand = llvm::ConstantAsMetadata::get(
+        llvm::ConstantInt::get(Int32Ty, IsBuffer ? 2 : 3));
+    AI->setMetadata("stack-protector", llvm::MDNode::get(Ctx, {Operand}));
   }
 }
 

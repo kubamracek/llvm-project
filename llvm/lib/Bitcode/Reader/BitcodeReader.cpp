@@ -1927,7 +1927,6 @@ static uint64_t getRawAttributeMask(Attribute::AttrKind Val) {
   case Attribute::NoInline:        return 1 << 11;
   case Attribute::AlwaysInline:    return 1 << 12;
   case Attribute::OptimizeForSize: return 1 << 13;
-  case Attribute::StackProtect:    return 1 << 14;
   case Attribute::StackProtectReq: return 1 << 15;
   case Attribute::Alignment:       return 31 << 16;
   // 1ULL << 21 is NoCapture, which is upgraded separately.
@@ -2246,8 +2245,6 @@ static Attribute::AttrKind getAttrFromCode(uint64_t Code) {
     return Attribute::Speculatable;
   case bitc::ATTR_KIND_STACK_ALIGNMENT:
     return Attribute::StackAlignment;
-  case bitc::ATTR_KIND_STACK_PROTECT:
-    return Attribute::StackProtect;
   case bitc::ATTR_KIND_STACK_PROTECT_REQ:
     return Attribute::StackProtectReq;
   case bitc::ATTR_KIND_STACK_PROTECT_STRONG:

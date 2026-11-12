@@ -1994,6 +1994,9 @@ public:
   std::optional<llvm::Attribute::AttrKind>
   StackProtectorAttribute(const Decl *D) const;
 
+  /// Whether \p D uses the basic -fstack-protector heuristic.
+  bool useBasicSSPHeuristic(const Decl *D) const;
+
   bool useMSVCGSBufferHeuristic(const Decl *D) const;
 
   std::string getPFPFieldName(const FieldDecl *FD);

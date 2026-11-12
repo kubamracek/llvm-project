@@ -824,8 +824,7 @@ bool SafeStack::run() {
 
   AllocaInst *StackGuardSlot = nullptr;
   // FIXME: implement weaker forms of stack protector.
-  if (F.hasFnAttribute(Attribute::StackProtect) ||
-      F.hasFnAttribute(Attribute::StackProtectStrong) ||
+  if (F.hasFnAttribute(Attribute::StackProtectStrong) ||
       F.hasFnAttribute(Attribute::StackProtectReq)) {
     Value *StackGuard = getStackGuard(IRB, F);
     StackGuardSlot = IRB.CreateAlloca(StackPtrTy, nullptr);

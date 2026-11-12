@@ -928,8 +928,6 @@ static uint64_t getAttrKindEncoding(Attribute::AttrKind Kind) {
     return bitc::ATTR_KIND_SPECULATABLE;
   case Attribute::StackAlignment:
     return bitc::ATTR_KIND_STACK_ALIGNMENT;
-  case Attribute::StackProtect:
-    return bitc::ATTR_KIND_STACK_PROTECT;
   case Attribute::StackProtectReq:
     return bitc::ATTR_KIND_STACK_PROTECT_REQ;
   case Attribute::StackProtectStrong:

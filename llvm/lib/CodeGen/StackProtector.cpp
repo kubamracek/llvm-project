@@ -258,31 +258,15 @@ bool StackProtector::runOnFunction(Function &Fn) {
 /// \param [out] IsLarge is set to true if a protectable array is found and
 /// it is "large" ( >= ssp-buffer-size).  In the case of a structure with
 /// multiple arrays, this gets set if any of them is large.
-static bool ContainsProtectableArray(Type *Ty, Module *M, unsigned SSPBufferSize,
-                                     bool &IsLarge, bool Strong,
-                                     bool InStruct) {
+static bool ContainsProtectableArray(Type *Ty, Module *M,
+                                     unsigned SSPBufferSize, bool &IsLarge) {
   if (!Ty)
     return false;
   if (ArrayType *AT = dyn_cast<ArrayType>(Ty)) {
-    if (!AT->getElementType()->isIntegerTy(8)) {
-      // If we're on a non-Darwin platform or we're inside of a structure, don't
-      // add stack protectors unless the array is a character array.
-      // However, in strong mode any array, regardless of type and size,
-      // triggers a protector.
-      if (!Strong && (InStruct || !M->getTargetTriple().isOSDarwin()))
-        return false;
-    }
-
-    // If an array has more than SSPBufferSize bytes of allocated space, then we
-    // emit stack protectors.
-    if (SSPBufferSize <= M->getDataLayout().getTypeAllocSize(AT)) {
+    // Any array triggers a protector; large ones go closest to the guard.
+    if (SSPBufferSize <= M->getDataLayout().getTypeAllocSize(AT))
       IsLarge = true;
-      return true;
-    }
-
-    if (Strong)
-      // Require a protector for all arrays in strong mode
-      return true;
+    return true;
   }
 
   const StructType *ST = dyn_cast<StructType>(Ty);
@@ -291,7 +275,7 @@ static bool ContainsProtectableArray(Type *Ty, Module *M, unsigned SSPBufferSize
 
   bool NeedsProtector = false;
   for (Type *ET : ST->elements())
-    if (ContainsProtectableArray(ET, M, SSPBufferSize, IsLarge, Strong, true)) {
+    if (ContainsProtectableArray(ET, M, SSPBufferSize, IsLarge)) {
       // If the element is a protectable array and is large (>= SSPBufferSize)
       // then we are done.  If the protectable array is not large, then
       // keep looking in case a subsequent element is a large array.
@@ -432,16 +416,8 @@ static const CallInst *findStackProtectorIntrinsic(Function &F) {
 /// Check whether or not this function needs a stack protector based
 /// upon the stack protector level.
 ///
-/// We use two heuristics: a standard (ssp) and strong (sspstrong).
-/// The standard heuristic which will add a guard variable to functions that
-/// call alloca with a either a variable size or a size >= SSPBufferSize,
-/// functions with character buffers larger than SSPBufferSize, and functions
-/// with aggregates containing character buffers larger than SSPBufferSize. The
-/// strong heuristic will add a guard variables to functions that call alloca
-/// regardless of size, functions with any buffer regardless of type and size,
-/// functions with aggregates that contain any buffer regardless of type and
-/// size, and functions that contain stack-based variables that have had their
-/// address taken.
+/// The strong heuristic (sspstrong, also used for sspreq's layout) protects
+/// functions with alloca calls, arrays, or address-taken locals.
 ///
 /// In every mode, "stack-protector" metadata on an alloca overrides the
 /// heuristic for that allocation.
@@ -451,7 +427,6 @@ static const CallInst *findStackProtectorIntrinsic(Function &F) {
 bool SSPLayoutAnalysis::requiresStackProtector(Function *F,
                                                SSPLayoutMap *Layout) {
   Module *M = F->getParent();
-  bool Strong = false;
   bool NeedsProtector = false;
 
   // The set of PHI nodes visited when determining if a variable's reference has
@@ -480,10 +455,7 @@ bool SSPLayoutAnalysis::requiresStackProtector(Function *F,
              << " due to a function attribute or command-line switch";
     });
     NeedsProtector = true;
-    Strong = true; // Use the same heuristic as strong to determine SSPLayout
-  } else if (F->hasFnAttribute(Attribute::StackProtectStrong))
-    Strong = true;
-  else if (!F->hasFnAttribute(Attribute::StackProtect))
+  } else if (!F->hasFnAttribute(Attribute::StackProtectStrong))
     return false;
 
   for (const BasicBlock &BB : *F) {
@@ -533,8 +505,8 @@ bool SSPLayoutAnalysis::requiresStackProtector(Function *F,
                   std::make_pair(AI, MachineFrameInfo::SSPLK_LargeArray));
               ORE.emit(RemarkBuilder);
               NeedsProtector = true;
-            } else if (Strong) {
-              // Require protectors for all alloca calls in strong mode.
+            } else {
+              // Small alloca calls too.
               if (!Layout)
                 return true;
               Layout->insert(
@@ -556,7 +528,7 @@ bool SSPLayoutAnalysis::requiresStackProtector(Function *F,
 
         bool IsLarge = false;
         if (ContainsProtectableArray(AI->getAllocatedType(), M, SSPBufferSize,
-                                     IsLarge, Strong, /*InStruct=*/false)) {
+                                     IsLarge)) {
           if (!Layout)
             return true;
           Layout->insert(std::make_pair(
@@ -573,23 +545,21 @@ bool SSPLayoutAnalysis::requiresStackProtector(Function *F,
           continue;
         }
 
-        if (Strong) {
-          std::optional<TypeSize> AllocSize =
-              AI->getAllocationSize(M->getDataLayout());
-          if (!AllocSize || HasAddressTaken(AI, *AllocSize, M, VisitedPHIs)) {
-            ++NumAddrTaken;
-            if (!Layout)
-              return true;
-            Layout->insert(std::make_pair(AI, MachineFrameInfo::SSPLK_AddrOf));
-            ORE.emit([&]() {
-              return OptimizationRemark(DEBUG_TYPE,
-                                        "StackProtectorAddressTaken", &I)
-                     << "Stack protection applied to function "
-                     << ore::NV("Function", F)
-                     << " due to the address of a local variable being taken";
-            });
-            NeedsProtector = true;
-          }
+        std::optional<TypeSize> AllocSize =
+            AI->getAllocationSize(M->getDataLayout());
+        if (!AllocSize || HasAddressTaken(AI, *AllocSize, M, VisitedPHIs)) {
+          ++NumAddrTaken;
+          if (!Layout)
+            return true;
+          Layout->insert(std::make_pair(AI, MachineFrameInfo::SSPLK_AddrOf));
+          ORE.emit([&]() {
+            return OptimizationRemark(DEBUG_TYPE, "StackProtectorAddressTaken",
+                                      &I)
+                   << "Stack protection applied to function "
+                   << ore::NV("Function", F)
+                   << " due to the address of a local variable being taken";
+          });
+          NeedsProtector = true;
         }
         // Clear any PHIs that we visited, to make sure we examine all uses of
         // any subsequent allocas that we look at.
