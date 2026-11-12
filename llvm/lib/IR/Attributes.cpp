@@ -26,7 +26,10 @@
 #include "llvm/IR/AttributeMask.h"
 #include "llvm/IR/ConstantRange.h"
 #include "llvm/IR/ConstantRangeList.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/InstIterator.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/IR/Type.h"
@@ -2616,6 +2619,54 @@ static void setOR(Function &Caller, const Function &Callee) {
     AttrClass::set(Caller, AttrClass::getKind(), true);
 }
 
+/// Returns the stack protector attribute of \p F, or None if it has none.
+static Attribute::AttrKind getSSPAttrKind(const Function &F) {
+  if (F.hasFnAttribute(Attribute::StackProtectReq))
+    return Attribute::StackProtectReq;
+  if (F.hasFnAttribute(Attribute::StackProtectStrong))
+    return Attribute::StackProtectStrong;
+  if (F.hasFnAttribute(Attribute::StackProtect))
+    return Attribute::StackProtect;
+  return Attribute::None;
+}
+
+/// Whether the "stack-protector" metadata in \p A and \p B was produced by
+/// the same frontend heuristic, as far as the function attributes tell.
+///
+/// TODO: This relies on the attributes identifying the heuristic: ssp for
+/// the basic one, sspstrong plus "stack-protector-gs-buffer" for MSVC's /GS.
+/// The latter has no other effect any more; it is the inliner-only tag that
+/// lets /GS code be told apart from code compiled with the strong heuristic.
+/// It is undecided whether such a tag is acceptable, and once basic mode is
+/// emitted as sspstrong it would need one as well.
+///
+/// TODO: Two functions using the same heuristic with different
+/// "stack-protector-buffer-size" values are treated as compatible, so the
+/// callee's marks keep the callee's buffer size.
+static bool haveSameSSPHeuristic(const Function &A, const Function &B) {
+  return getSSPAttrKind(A) == getSSPAttrKind(B) &&
+         A.getFnAttribute("stack-protector-gs-buffer").getValueAsBool() ==
+             B.getFnAttribute("stack-protector-gs-buffer").getValueAsBool();
+}
+
+/// Drop every "stack-protector" metadata of value 3 in \p F, which records that
+/// a frontend heuristic found the alloca not to need a protector. The allocas
+/// are then classified by the backend, under \p F's attributes. Explicit
+/// opt-outs (value 0) and buffers (values 1 and 2) are kept.
+static void dropHeuristicSSPOptOuts(Function &F) {
+  for (Instruction &I : instructions(F)) {
+    auto *AI = dyn_cast<AllocaInst>(&I);
+    if (!AI)
+      continue;
+    const MDNode *MD = AI->getMetadata("stack-protector");
+    if (!MD || MD->getNumOperands() != 1)
+      continue;
+    const auto *CI = mdconst::dyn_extract<ConstantInt>(MD->getOperand(0));
+    if (CI && CI->getLimitedValue() == 3)
+      AI->setMetadata("stack-protector", nullptr);
+  }
+}
+
 /// If the inlined function had a higher stack protection level than the
 /// calling function, then bump up the caller's stack protection level.
 static void adjustCallerSSPLevel(Function &Caller, const Function &Callee) {
@@ -2625,14 +2676,23 @@ static void adjustCallerSSPLevel(Function &Caller, const Function &Callee) {
   if (!Caller.hasStackProtectorFnAttr())
     return;
 
-  // The caller may be using MSVC's /GS heuristic, which protects fewer
-  // functions than "strong" does. If the callee asked for the stronger
-  // heuristic, drop the /GS marker so that inlining cannot weaken the
-  // protection the callee was compiled with.
-  if ((Callee.hasFnAttribute(Attribute::StackProtectStrong) ||
-       Callee.hasFnAttribute(Attribute::StackProtectReq)) &&
-      !Callee.hasFnAttribute("stack-protector-gs-buffer"))
-    Caller.removeFnAttr("stack-protector-gs-buffer");
+  // A frontend heuristic's opt-outs only hold for the mode it implements.
+  // When code from two different modes is merged, let the backend classify
+  // those allocas again, which errs towards more protection: a caller that is
+  // upgraded re-examines its own allocas, as it would if it had no metadata,
+  // and the callee's allocas are classified under the caller's mode. This
+  // runs after the callee's body has been inlined, so it sees the allocas of
+  // both.
+  //
+  // The merged function's allocas are then no longer all classified by MSVC's
+  // /GS heuristic, so it loses the attribute that says they are, unless the
+  // callee has it too.
+  if (Callee.hasStackProtectorFnAttr() &&
+      !haveSameSSPHeuristic(Caller, Callee)) {
+    dropHeuristicSSPOptOuts(Caller);
+    if (!Callee.getFnAttribute("stack-protector-gs-buffer").getValueAsBool())
+      Caller.removeFnAttr("stack-protector-gs-buffer");
+  }
 
   // If upgrading the SSP attribute, clear out the old SSP Attributes first.
   // Having multiple SSP attributes doesn't actually hurt, but it adds useless

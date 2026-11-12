@@ -38,6 +38,7 @@
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Type.h"
@@ -1732,6 +1733,21 @@ void CodeGenFunction::MarkGSBufferAlloca(llvm::AllocaInst *AI, bool IsLarge) {
   auto *Operand =
       llvm::ConstantAsMetadata::get(Builder.getInt32(IsLarge ? 2 : 1));
   AI->setMetadata("stack-protector", llvm::MDNode::get(Ctx, {Operand}));
+}
+
+void CodeGenFunction::EmitGSNonBufferStackProtectorMD() {
+  // 3 says that the function's heuristic found no buffer; see the
+  // "stack-protector" metadata in LLVM's LangRef. The GS buffers were marked
+  // as they were created, and an explicit opt-out keeps its 0. Calls to alloca
+  // and VLAs are left to the backend, which protects them at any size.
+  llvm::MDNode *NotABuffer = llvm::MDNode::get(
+      getLLVMContext(),
+      {llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(Int32Ty, 3))});
+  for (llvm::Instruction &I : llvm::instructions(CurFn)) {
+    auto *AI = dyn_cast<llvm::AllocaInst>(&I);
+    if (AI && !AI->isArrayAllocation() && !AI->getMetadata("stack-protector"))
+      AI->setMetadata("stack-protector", NotABuffer);
+  }
 }
 
 void CodeGenFunction::EmitGSBufferStackProtectorMD(llvm::Value *AllocaPtr,

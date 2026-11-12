@@ -552,6 +552,9 @@ void CodeGenFunction::FinishFunction(SourceLocation EndLoc) {
       ReturnValue = Address::invalid();
     }
   }
+
+  if (MarkGSBuffers)
+    EmitGSNonBufferStackProtectorMD();
 }
 
 /// ShouldInstrumentFunction - Return true if the current function should be
