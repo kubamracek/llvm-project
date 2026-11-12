@@ -1574,8 +1574,13 @@ private:
 
   /// Whether this function is compiled with MSVC's /GS heuristic, so that its
   /// allocas have to be classified here rather than in the backend. See
-  /// EmitGSBufferStackProtectorMD.
+  /// EmitGSBufferStackProtectorMD and EmitHeuristicStackProtectorMD.
   bool MarkGSBuffers = false;
+
+  /// Whether this function is compiled with the basic -fstack-protector
+  /// heuristic, so that FinishFunction classifies its allocas here rather than
+  /// leaving it to the backend. See EmitHeuristicStackProtectorMD.
+  bool MarkBasicSSPAllocas = false;
 
   /// IndirectBranch - The first time an indirect goto is seen we create a block
   /// with an indirect branch.  Every time we see the address of a label taken,
@@ -3631,9 +3636,10 @@ public:
   /// \p IsLarge says the buffer should be laid out closest to the guard.
   void MarkGSBufferAlloca(llvm::AllocaInst *AI, bool IsLarge);
 
-  /// Under MSVC's /GS heuristic, mark every fixed-size alloca of the current
-  /// function that isn't a GS buffer as not needing a protector.
-  void EmitGSNonBufferStackProtectorMD();
+  /// Attach "stack-protector" metadata to every fixed-size alloca of the
+  /// current function that has none yet, saying whether the function's stack
+  /// protector heuristic (basic -fstack-protector or MSVC's /GS) protects it.
+  void EmitHeuristicStackProtectorMD();
 
   void EmitAutoVarInit(const AutoVarEmission &emission);
   void EmitAutoVarCleanups(const AutoVarEmission &emission);

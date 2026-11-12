@@ -553,8 +553,8 @@ void CodeGenFunction::FinishFunction(SourceLocation EndLoc) {
     }
   }
 
-  if (MarkGSBuffers)
-    EmitGSNonBufferStackProtectorMD();
+  if (MarkBasicSSPAllocas || MarkGSBuffers)
+    EmitHeuristicStackProtectorMD();
 }
 
 /// ShouldInstrumentFunction - Return true if the current function should be
@@ -764,6 +764,10 @@ void CodeGenFunction::StartFunction(GlobalDecl GD, QualType RetTy,
   // with a stack protector attribute at all.
   MarkGSBuffers = CGM.useMSVCGSBufferHeuristic(D) &&
                   CGM.StackProtectorAttribute(D).has_value();
+  // The basic -fstack-protector heuristic is applied once the function is
+  // complete, in FinishFunction.
+  MarkBasicSSPAllocas =
+      CGM.StackProtectorAttribute(D) == llvm::Attribute::StackProtect;
   FnRetTy = RetTy;
   CurFn = Fn;
   CurFnInfo = &FnInfo;

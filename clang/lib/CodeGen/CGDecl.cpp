@@ -1735,18 +1735,65 @@ void CodeGenFunction::MarkGSBufferAlloca(llvm::AllocaInst *AI, bool IsLarge) {
   AI->setMetadata("stack-protector", llvm::MDNode::get(Ctx, {Operand}));
 }
 
-void CodeGenFunction::EmitGSNonBufferStackProtectorMD() {
-  // 3 says that the function's heuristic found no buffer; see the
-  // "stack-protector" metadata in LLVM's LangRef. The GS buffers were marked
-  // as they were created, and an explicit opt-out keeps its 0. Calls to alloca
-  // and VLAs are left to the backend, which protects them at any size.
-  llvm::MDNode *NotABuffer = llvm::MDNode::get(
-      getLLVMContext(),
-      {llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(Int32Ty, 3))});
+/// Returns true if the basic -fstack-protector heuristic protects an alloca of
+/// type \p Ty: an array of at least \p SSPBufferSize bytes, of char type unless
+/// it is a top-level array on Darwin, or a struct containing one.
+///
+/// This is ContainsProtectableArray in LLVM's StackProtector.cpp, which only
+/// ever accepts a large array when it isn't in strong mode. Until the backend
+/// stops classifying unmarked allocas of ssp functions, the two must agree, or
+/// the decision would depend on whether an alloca kept its metadata.
+///
+/// TODO: This works on IR types, as the backend does, so it still treats
+/// clang's [N x i8] struct padding as a char buffer (#66709). Fixing that
+/// needs the alloca's source type, so it has to be classified where it is
+/// created, the way the /GS heuristic does it, rather than here. Note that
+/// the [N x i8] filler of a union can be part of a real char array member.
+static bool isBasicSSPBuffer(llvm::Type *Ty, const llvm::DataLayout &DL,
+                             bool IsDarwin, unsigned SSPBufferSize,
+                             bool InStruct) {
+  if (auto *AT = dyn_cast<llvm::ArrayType>(Ty)) {
+    if (!AT->getElementType()->isIntegerTy(8) && (InStruct || !IsDarwin))
+      return false;
+    return DL.getTypeAllocSize(AT).getFixedValue() >= SSPBufferSize;
+  }
+  if (auto *ST = dyn_cast<llvm::StructType>(Ty))
+    return llvm::any_of(ST->elements(), [&](llvm::Type *ElemTy) {
+      return isBasicSSPBuffer(ElemTy, DL, IsDarwin, SSPBufferSize,
+                              /*InStruct=*/true);
+    });
+  return false;
+}
+
+void CodeGenFunction::EmitHeuristicStackProtectorMD() {
+  const llvm::DataLayout &DL = CGM.getDataLayout();
+  bool IsDarwin = CGM.getTriple().isOSDarwin();
+  unsigned SSPBufferSize = CGM.getCodeGenOpts().SSPBufferSize;
+  llvm::LLVMContext &Ctx = getLLVMContext();
+
+  // TODO: ClangIR doesn't do this yet, so there the backend's rule applies.
   for (llvm::Instruction &I : llvm::instructions(CurFn)) {
     auto *AI = dyn_cast<llvm::AllocaInst>(&I);
-    if (AI && !AI->isArrayAllocation() && !AI->getMetadata("stack-protector"))
-      AI->setMetadata("stack-protector", NotABuffer);
+    // Calls to alloca and VLAs are classified by their size, which the
+    // backend sees just as well; the /GS heuristic marks the ones that need it
+    // as they are created. An existing mark is either that, a /GS buffer, or
+    // an explicit opt-out (see StackProtectorIgnoreAttr).
+    if (!AI || AI->isArrayAllocation() || AI->getMetadata("stack-protector"))
+      continue;
+
+    // 2 is a large buffer, which is all the basic heuristic protects, and 3
+    // says the heuristic found no buffer; see the "stack-protector" metadata
+    // in LLVM's LangRef. Unlike an explicit opt-out, the inliner drops a 3
+    // when it merges this function with code of another mode. Under /GS the
+    // buffers were marked as they were created, so everything else is not
+    // one.
+    bool IsBuffer =
+        !MarkGSBuffers && isBasicSSPBuffer(AI->getAllocatedType(), DL,
+                                           IsDarwin, SSPBufferSize,
+                                           /*InStruct=*/false);
+    auto *Operand = llvm::ConstantAsMetadata::get(
+        llvm::ConstantInt::get(Int32Ty, IsBuffer ? 2 : 3));
+    AI->setMetadata("stack-protector", llvm::MDNode::get(Ctx, {Operand}));
   }
 }
 
