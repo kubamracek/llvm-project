@@ -1163,6 +1163,12 @@ static bool isStackProtectorOn(const LangOptions &LangOpts,
   return LangOpts.getStackProtector() == Mode;
 }
 
+bool CodeGenModule::useBasicSSPHeuristic(const Decl *D) const {
+  return isStackProtectorOn(LangOpts, getTriple(), LangOptions::SSPOn) &&
+         !(D && (D->hasAttr<NoStackProtectorAttr>() ||
+                 D->hasAttr<StrictGuardStackCheckAttr>()));
+}
+
 bool CodeGenModule::useMSVCGSBufferHeuristic(const Decl *D) const {
   return isStackProtectorOn(LangOpts, getTriple(), LangOptions::SSPMSVC) &&
          !(D && D->hasAttr<StrictGuardStackCheckAttr>());
@@ -1176,8 +1182,10 @@ CodeGenModule::StackProtectorAttribute(const Decl *D) const {
            (isStackProtectorOn(LangOpts, getTriple(), LangOptions::SSPOn) ||
             isStackProtectorOn(LangOpts, getTriple(), LangOptions::SSPMSVC)))
     return llvm::Attribute::StackProtectStrong;
+  // The basic heuristic is implemented in clang, as sspstrong plus
+  // "stack-protector" metadata on every alloca; see useBasicSSPHeuristic.
   else if (isStackProtectorOn(LangOpts, getTriple(), LangOptions::SSPOn))
-    return llvm::Attribute::StackProtect;
+    return llvm::Attribute::StackProtectStrong;
   else if (isStackProtectorOn(LangOpts, getTriple(), LangOptions::SSPStrong))
     return llvm::Attribute::StackProtectStrong;
   else if (isStackProtectorOn(LangOpts, getTriple(), LangOptions::SSPReq))

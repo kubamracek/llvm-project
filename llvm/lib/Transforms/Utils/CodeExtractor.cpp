@@ -1015,7 +1015,6 @@ Function *CodeExtractor::constructFunctionDeclaration(
       case Attribute::SanitizeRealtimeBlocking:
       case Attribute::SanitizeAllocToken:
       case Attribute::SpeculativeLoadHardening:
-      case Attribute::StackProtect:
       case Attribute::StackProtectReq:
       case Attribute::StackProtectStrong:
       case Attribute::StrictFP:

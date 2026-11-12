@@ -2699,7 +2699,7 @@ fn -> other_fn -> other_fn ; fn is norecurse
 
     If a function that has a `safestack` attribute is inlined into a
     function that doesn't have a `safestack` attribute or which has an
-    `ssp`, `sspstrong` or `sspreq` attribute, then the resulting
+    `sspstrong` or `sspreq` attribute, then the resulting
     function will have a `safestack` attribute.
 
 `sanitize_address`
@@ -2769,30 +2769,13 @@ fn -> other_fn -> other_fn ; fn is norecurse
     undefined behavior, the undefined behavior may be observed even
     if the call site is dead code.
 
-`ssp`
-:   This attribute indicates that the function should emit a stack
-    smashing protector. It is in the form of a "canary" --- a random value
-    placed on the stack before the local variables that's checked upon
-    return from the function to see if it has been overwritten. A
-    heuristic is used to determine if a function needs stack protectors
-    or not. The heuristic used will enable protectors for functions with:
-
-    - Character arrays larger than `ssp-buffer-size` (default 8).
-    - Aggregates containing character arrays larger than `ssp-buffer-size`.
-    - Calls to alloca() with variable sizes or constant sizes greater than
-      `ssp-buffer-size`.
-
-    Variables that are identified as requiring a protector will be arranged
-    on the stack such that they are adjacent to the stack protector guard.
-
-    If a function with an `ssp` attribute is inlined into a calling function,
-    the attribute is not carried over to the calling function.
-
 `sspstrong`
 :   This attribute indicates that the function should emit a stack smashing
-    protector. This attribute causes a strong heuristic to be used when
-    determining if a function needs stack protectors. The strong heuristic
-    will enable protectors for functions with:
+    protector. It is in the form of a "canary" --- a random value placed on
+    the stack before the local variables that's checked upon return from the
+    function to see if it has been overwritten. A heuristic is used to
+    determine if a function needs stack protectors, which will enable
+    protectors for functions with:
 
     - Arrays of any size and type
     - Aggregates containing an array of any size and type.
@@ -2810,16 +2793,15 @@ fn -> other_fn -> other_fn ; fn is norecurse
     1. Variables that have had their address taken are 3rd closest to the
        protector.
 
-    This overrides the `ssp` function attribute.
+    A frontend can implement a heuristic of its own on top of this one, by
+    classifying allocas with [`stack-protector` metadata](#stack-protector-metadata).
 
-    If a function with an `sspstrong` attribute is inlined into a calling
-    function which has an `ssp` attribute, the calling function's attribute
-    will be upgraded to `sspstrong`.
+    The `ssp` attribute, which selected a weaker heuristic, has been removed;
+    IR and bitcode that use it are upgraded to `sspstrong`.
 
 `sspreq`
 :   This attribute indicates that the function should *always* emit a stack
-    smashing protector. This overrides the `ssp` and `sspstrong` function
-    attributes.
+    smashing protector. This overrides the `sspstrong` function attribute.
 
     Variables that are identified as requiring a protector will be arranged
     on the stack such that they are adjacent to the stack protector guard.
@@ -2833,8 +2815,8 @@ fn -> other_fn -> other_fn ; fn is norecurse
        protector.
 
     If a function with an `sspreq` attribute is inlined into a calling
-    function which has an `ssp` or `sspstrong` attribute, the calling
-    function's attribute will be upgraded to `sspreq`.
+    function which has an `sspstrong` attribute, the calling function's
+    attribute will be upgraded to `sspreq`.
 
 `"stack-protector-gs-buffer"`
 :   This attribute says that the frontend classified the function's allocas
@@ -2842,7 +2824,7 @@ fn -> other_fn -> other_fn ; fn is norecurse
     [`stack-protector` metadata](#stack-protector-metadata). It takes a
     boolean value, and is emitted by clang-cl next to `sspstrong`. It has no
     effect on code generation: allocas without metadata are classified by
-    the function's `ssp`, `sspstrong` or `sspreq` attribute as usual.
+    the function's `sspstrong` or `sspreq` attribute as usual.
 
     It only matters to inlining. If a function with a stack protector
     attribute is inlined into a calling function, and the two differ in
@@ -9202,8 +9184,8 @@ call ptr @malloc(i64 64), !alloc_token !0
 #### '`stack-protector`' Metadata
 
 The `stack-protector` metadata may be attached to alloca instructions.  It
-overrides, for that one allocation, the heuristic that the `ssp` and
-`sspstrong` function attributes would otherwise apply. The function may still
+overrides, for that one allocation, the heuristic that the `sspstrong`
+function attribute would otherwise apply. The function may still
 use a stack protector, if other criteria determine it needs one.
 
 The metadata contains a single integer:

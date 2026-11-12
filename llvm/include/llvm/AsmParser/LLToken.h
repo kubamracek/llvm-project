@@ -197,6 +197,7 @@ enum Kind {
   kw_attributes,
   kw_sync,
   kw_async,
+  kw_ssp, // Removed attribute, upgraded to sspstrong.
 #define GET_ATTR_NAMES
 #define ATTRIBUTE_ENUM(ENUM_NAME, DISPLAY_NAME) \
   kw_##DISPLAY_NAME,

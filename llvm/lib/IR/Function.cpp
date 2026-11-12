@@ -835,8 +835,7 @@ void Function::clearGC() {
 }
 
 bool Function::hasStackProtectorFnAttr() const {
-  return hasFnAttribute(Attribute::StackProtect) ||
-         hasFnAttribute(Attribute::StackProtectStrong) ||
+  return hasFnAttribute(Attribute::StackProtectStrong) ||
          hasFnAttribute(Attribute::StackProtectReq);
 }
 

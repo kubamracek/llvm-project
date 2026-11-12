@@ -3450,7 +3450,6 @@ ItaniumCXXABI::getOrCreateVirtualFunctionPointerThunk(const CXXMethodDecl *MD) {
   CGM.SetLLVMFunctionAttributesForDefinition(MD, ThunkFn);
 
   // Stack protection sometimes gets inserted after the musttail call.
-  ThunkFn->removeFnAttr(llvm::Attribute::StackProtect);
   ThunkFn->removeFnAttr(llvm::Attribute::StackProtectStrong);
   ThunkFn->removeFnAttr(llvm::Attribute::StackProtectReq);
 

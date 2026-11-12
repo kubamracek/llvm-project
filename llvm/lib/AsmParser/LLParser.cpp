@@ -1687,6 +1687,10 @@ bool LLParser::parseUnnamedAttrGrp() {
 
 static Attribute::AttrKind tokenToAttribute(lltok::Kind Kind) {
   switch (Kind) {
+  // The basic stack protector heuristic moved into the frontend; what is left
+  // of ssp is sspstrong.
+  case lltok::kw_ssp:
+    return Attribute::StackProtectStrong;
 #define GET_ATTR_NAMES
 #define ATTRIBUTE_ENUM(ENUM_NAME, DISPLAY_NAME) \
   case lltok::kw_##DISPLAY_NAME: \

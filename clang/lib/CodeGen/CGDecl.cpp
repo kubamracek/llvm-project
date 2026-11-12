@@ -1739,10 +1739,9 @@ void CodeGenFunction::MarkGSBufferAlloca(llvm::AllocaInst *AI, bool IsLarge) {
 /// type \p Ty: an array of at least \p SSPBufferSize bytes, of char type unless
 /// it is a top-level array on Darwin, or a struct containing one.
 ///
-/// This is ContainsProtectableArray in LLVM's StackProtector.cpp, which only
-/// ever accepts a large array when it isn't in strong mode. Until the backend
-/// stops classifying unmarked allocas of ssp functions, the two must agree, or
-/// the decision would depend on whether an alloca kept its metadata.
+/// This is the rule LLVM's backend used to apply to allocas of ssp functions,
+/// before the basic heuristic moved into clang. It works on the same IR types,
+/// so the decisions don't change.
 ///
 /// TODO: This works on IR types, as the backend does, so it still treats
 /// clang's [N x i8] struct padding as a char buffer (#66709). Fixing that
@@ -1774,12 +1773,20 @@ void CodeGenFunction::EmitHeuristicStackProtectorMD() {
   // TODO: ClangIR doesn't do this yet, so there the backend's rule applies.
   for (llvm::Instruction &I : llvm::instructions(CurFn)) {
     auto *AI = dyn_cast<llvm::AllocaInst>(&I);
-    // Calls to alloca and VLAs are classified by their size, which the
-    // backend sees just as well; the /GS heuristic marks the ones that need it
-    // as they are created. An existing mark is either that, a /GS buffer, or
-    // an explicit opt-out (see StackProtectorIgnoreAttr).
-    if (!AI || AI->isArrayAllocation() || AI->getMetadata("stack-protector"))
+    // An existing mark is a /GS buffer, a call to alloca the /GS heuristic
+    // classified, or an explicit opt-out (see StackProtectorIgnoreAttr).
+    if (!AI || AI->getMetadata("stack-protector"))
       continue;
+
+    // Calls to alloca and VLAs are classified by their size, which the
+    // backend sees just as well: under sspstrong it protects all of them.
+    // The basic heuristic leaves out a constant-size one below ssp-buffer-size.
+    if (AI->isArrayAllocation()) {
+      const auto *Size = dyn_cast<llvm::ConstantInt>(AI->getArraySize());
+      if (MarkGSBuffers || !Size ||
+          Size->getLimitedValue(SSPBufferSize) >= SSPBufferSize)
+        continue;
+    }
 
     // 2 is a large buffer, which is all the basic heuristic protects, and 3
     // says the heuristic found no buffer; see the "stack-protector" metadata

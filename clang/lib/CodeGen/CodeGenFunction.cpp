@@ -766,8 +766,7 @@ void CodeGenFunction::StartFunction(GlobalDecl GD, QualType RetTy,
                   CGM.StackProtectorAttribute(D).has_value();
   // The basic -fstack-protector heuristic is applied once the function is
   // complete, in FinishFunction.
-  MarkBasicSSPAllocas =
-      CGM.StackProtectorAttribute(D) == llvm::Attribute::StackProtect;
+  MarkBasicSSPAllocas = CGM.useBasicSSPHeuristic(D);
   FnRetTy = RetTy;
   CurFn = Fn;
   CurFnInfo = &FnInfo;

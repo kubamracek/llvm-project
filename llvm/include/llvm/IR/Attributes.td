@@ -321,9 +321,6 @@ def StackAlignment : IntAttr<"alignstack", IntersectPreserve,
 /// Function can be speculated.
 def Speculatable : EnumAttr<"speculatable", IntersectAnd, [FnAttr]>;
 
-/// Stack protection.
-def StackProtect : EnumAttr<"ssp", IntersectPreserve, [FnAttr]>;
-
 /// Stack protection required.
 def StackProtectReq : EnumAttr<"sspreq", IntersectPreserve, [FnAttr]>;
 

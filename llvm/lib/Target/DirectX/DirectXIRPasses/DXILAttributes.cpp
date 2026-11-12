@@ -51,7 +51,6 @@ const AttributeMask &getNonDXILAttributeMask() {
                                      Attribute::ReturnsTwice,
                                      Attribute::SExt,
                                      Attribute::StackAlignment,
-                                     Attribute::StackProtect,
                                      Attribute::StackProtectReq,
                                      Attribute::StackProtectStrong,
                                      Attribute::SafeStack,

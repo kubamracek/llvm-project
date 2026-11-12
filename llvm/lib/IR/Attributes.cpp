@@ -2625,20 +2625,20 @@ static Attribute::AttrKind getSSPAttrKind(const Function &F) {
     return Attribute::StackProtectReq;
   if (F.hasFnAttribute(Attribute::StackProtectStrong))
     return Attribute::StackProtectStrong;
-  if (F.hasFnAttribute(Attribute::StackProtect))
-    return Attribute::StackProtect;
   return Attribute::None;
 }
 
 /// Whether the "stack-protector" metadata in \p A and \p B was produced by
 /// the same frontend heuristic, as far as the function attributes tell.
 ///
-/// TODO: This relies on the attributes identifying the heuristic: ssp for
-/// the basic one, sspstrong plus "stack-protector-gs-buffer" for MSVC's /GS.
-/// The latter has no other effect any more; it is the inliner-only tag that
-/// lets /GS code be told apart from code compiled with the strong heuristic.
-/// It is undecided whether such a tag is acceptable, and once basic mode is
-/// emitted as sspstrong it would need one as well.
+/// TODO: This relies on the attributes identifying the heuristic, and they
+/// no longer do: the basic -fstack-protector heuristic and the strong one are
+/// both sspstrong now, so a basic-mode callee inlined into a strong caller
+/// keeps its opt-outs (value 3), and a strong callee inlined into a basic-mode
+/// caller leaves the caller's opt-outs in place. Both protect less than the
+/// strong code asked for. "stack-protector-gs-buffer" is an inliner-only tag
+/// that tells /GS code apart; basic mode would need one too, or the frontend
+/// would have to mark its allocas some other way. It is undecided which.
 ///
 /// TODO: Two functions using the same heuristic with different
 /// "stack-protector-buffer-size" values are treated as compatible, so the
@@ -2698,8 +2698,7 @@ static void adjustCallerSSPLevel(Function &Caller, const Function &Callee) {
   // Having multiple SSP attributes doesn't actually hurt, but it adds useless
   // clutter to the IR.
   AttributeMask OldSSPAttr;
-  OldSSPAttr.addAttribute(Attribute::StackProtect)
-      .addAttribute(Attribute::StackProtectStrong)
+  OldSSPAttr.addAttribute(Attribute::StackProtectStrong)
       .addAttribute(Attribute::StackProtectReq);
 
   if (Callee.hasFnAttribute(Attribute::StackProtectReq)) {
@@ -2709,10 +2708,7 @@ static void adjustCallerSSPLevel(Function &Caller, const Function &Callee) {
              !Caller.hasFnAttribute(Attribute::StackProtectReq)) {
     Caller.removeFnAttrs(OldSSPAttr);
     Caller.addFnAttr(Attribute::StackProtectStrong);
-  } else if (Callee.hasFnAttribute(Attribute::StackProtect) &&
-             !Caller.hasFnAttribute(Attribute::StackProtectReq) &&
-             !Caller.hasFnAttribute(Attribute::StackProtectStrong))
-    Caller.addFnAttr(Attribute::StackProtect);
+  }
 }
 
 /// If the inlined function required stack probes, then ensure that

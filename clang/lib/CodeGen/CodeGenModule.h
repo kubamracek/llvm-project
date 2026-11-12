@@ -1994,6 +1994,10 @@ public:
   std::optional<llvm::Attribute::AttrKind>
   StackProtectorAttribute(const Decl *D) const;
 
+  /// Whether the allocas of \p D are classified by the basic
+  /// -fstack-protector heuristic, which clang implements on top of sspstrong.
+  bool useBasicSSPHeuristic(const Decl *D) const;
+
   bool useMSVCGSBufferHeuristic(const Decl *D) const;
 
   std::string getPFPFieldName(const FieldDecl *FD);
