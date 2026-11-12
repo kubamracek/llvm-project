@@ -63,10 +63,6 @@ static cl::opt<bool> EnableSelectionDAGSP("enable-selectiondag-sp",
 static cl::opt<bool> DisableCheckNoReturn("disable-check-noreturn-call",
                                           cl::init(false), cl::Hidden);
 
-/// Function attribute selecting MSVC's /GS (Buffer Security Check) heuristic.
-/// Emitted by clang-cl.
-static constexpr const char *GSBufferAttr = "stack-protector-gs-buffer";
-
 /// Values of the "stack-protector" metadata that may be attached to an alloca
 /// to override the heuristic for that allocation. See LangRef.
 enum SSPAllocaMD : uint32_t {
@@ -78,6 +74,8 @@ enum SSPAllocaMD : uint32_t {
   /// This alloca is a buffer that requires a protector, and is laid out like a
   /// large (>= ssp-buffer-size) array.
   SSPAMD_LargeBuffer = 2,
+  /// Not a buffer, per the frontend's heuristic.
+  SSPAMD_HeuristicIgnore = 3,
 };
 
 /// Read the "stack-protector" metadata of \p AI, if it has any.
@@ -88,9 +86,9 @@ static std::optional<uint32_t> getSSPAllocaMD(const AllocaInst &AI) {
   const auto *CI = mdconst::dyn_extract<ConstantInt>(MD->getOperand(0));
   if (!CI)
     return std::nullopt;
-  // Clamp, so that a value from a newer producer errs towards more protection
-  // rather than less.
-  return CI->getLimitedValue(SSPAMD_LargeBuffer);
+  // Unknown values: large buffer.
+  uint64_t V = CI->getLimitedValue();
+  return V > SSPAMD_HeuristicIgnore ? SSPAMD_LargeBuffer : V;
 }
 
 /// InsertStackProtectors - Insert code into the prologue and epilogue of the
@@ -434,8 +432,7 @@ static const CallInst *findStackProtectorIntrinsic(Function &F) {
 /// Check whether or not this function needs a stack protector based
 /// upon the stack protector level.
 ///
-/// We use three heuristics: a standard (ssp), a strong (sspstrong) and an
-/// MSVC-compatible one selected by the "stack-protector-gs-buffer" attribute.
+/// We use two heuristics: a standard (ssp) and strong (sspstrong).
 /// The standard heuristic which will add a guard variable to functions that
 /// call alloca with a either a variable size or a size >= SSPBufferSize,
 /// functions with character buffers larger than SSPBufferSize, and functions
@@ -444,22 +441,18 @@ static const CallInst *findStackProtectorIntrinsic(Function &F) {
 /// regardless of size, functions with any buffer regardless of type and size,
 /// functions with aggregates that contain any buffer regardless of type and
 /// size, and functions that contain stack-based variables that have had their
-/// address taken. The MSVC heuristic implements /GS (Buffer Security Check):
-/// it adds a guard variable to functions that call alloca regardless of size
-/// and to functions with an alloca that the frontend marked as a "GS buffer"
-/// using "stack-protector" metadata, but it does not consider a variable's
-/// address being taken. Deciding what a GS buffer is needs source-level type
-/// information that lowering to IR does not preserve, which is why that part
-/// of the heuristic lives in the frontend.
+/// address taken.
 ///
 /// In every mode, "stack-protector" metadata on an alloca overrides the
 /// heuristic for that allocation.
+///
+/// TODO: Under /GS, pass-created allocas now get the strong heuristic. Do an
+/// audit to either allow that or fix individual passes.
 bool SSPLayoutAnalysis::requiresStackProtector(Function *F,
                                                SSPLayoutMap *Layout) {
   Module *M = F->getParent();
   bool Strong = false;
   bool NeedsProtector = false;
-  bool GSBuffer = false;
 
   // The set of PHI nodes visited when determining if a variable's reference has
   // been taken.  This set is maintained to ensure we don't visit the same PHI
@@ -488,23 +481,16 @@ bool SSPLayoutAnalysis::requiresStackProtector(Function *F,
     });
     NeedsProtector = true;
     Strong = true; // Use the same heuristic as strong to determine SSPLayout
-  } else if (F->hasFnAttribute(Attribute::StackProtectStrong)) {
-    // clang-cl's default /GS asks for MSVC's GS-buffer rules rather than the
-    // GCC-compatible strong heuristic. An explicit sspreq (handled above)
-    // still wins over both.
-    GSBuffer = F->getFnAttribute(GSBufferAttr).getValueAsBool();
-    Strong = !GSBuffer;
-  } else if (F->hasFnAttribute(Attribute::StackProtect)) {
-    GSBuffer = F->getFnAttribute(GSBufferAttr).getValueAsBool();
-  } else {
+  } else if (F->hasFnAttribute(Attribute::StackProtectStrong))
+    Strong = true;
+  else if (!F->hasFnAttribute(Attribute::StackProtect))
     return false;
-  }
 
   for (const BasicBlock &BB : *F) {
     for (const Instruction &I : BB) {
       if (const AllocaInst *AI = dyn_cast<AllocaInst>(&I)) {
         if (std::optional<uint32_t> MD = getSSPAllocaMD(*AI)) {
-          if (*MD == SSPAMD_Ignore)
+          if (*MD == SSPAMD_Ignore || *MD == SSPAMD_HeuristicIgnore)
             continue;
 
           // The frontend classified this allocation as a buffer, which is
@@ -547,10 +533,8 @@ bool SSPLayoutAnalysis::requiresStackProtector(Function *F,
                   std::make_pair(AI, MachineFrameInfo::SSPLK_LargeArray));
               ORE.emit(RemarkBuilder);
               NeedsProtector = true;
-            } else if (Strong || GSBuffer) {
-              // Require protectors for all alloca calls in strong mode. MSVC's
-              // /GS likewise treats every _alloca buffer as a GS buffer, with
-              // no size threshold.
+            } else if (Strong) {
+              // Require protectors for all alloca calls in strong mode.
               if (!Layout)
                 return true;
               Layout->insert(
@@ -569,11 +553,6 @@ bool SSPLayoutAnalysis::requiresStackProtector(Function *F,
           }
           continue;
         }
-
-        // Under MSVC's /GS the frontend has already picked out the buffers, so
-        // an unmarked alloca never requires a protector.
-        if (GSBuffer)
-          continue;
 
         bool IsLarge = false;
         if (ContainsProtectableArray(AI->getAllocatedType(), M, SSPBufferSize,

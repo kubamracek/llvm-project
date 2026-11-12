@@ -3178,8 +3178,6 @@ void CodeGenModule::SetLLVMFunctionAttributesForDefinition(const Decl *D,
   if (std::optional<llvm::Attribute::AttrKind> Attr =
           StackProtectorAttribute(D)) {
     B.addAttribute(*Attr);
-    if (useMSVCGSBufferHeuristic(D))
-      B.addAttribute("stack-protector-gs-buffer", "true");
   }
 
   if (!D) {

@@ -3631,6 +3631,9 @@ public:
   /// \p IsLarge says the buffer should be laid out closest to the guard.
   void MarkGSBufferAlloca(llvm::AllocaInst *AI, bool IsLarge);
 
+  /// Under /GS, mark fixed-size allocas that aren't GS buffers as not buffers.
+  void EmitGSNonBufferStackProtectorMD();
+
   void EmitAutoVarInit(const AutoVarEmission &emission);
   void EmitAutoVarCleanups(const AutoVarEmission &emission);
   void emitAutoVarTypeCleanup(const AutoVarEmission &emission,

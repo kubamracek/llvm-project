@@ -2836,29 +2836,6 @@ fn -> other_fn -> other_fn ; fn is norecurse
     function which has an `ssp` or `sspstrong` attribute, the calling
     function's attribute will be upgraded to `sspreq`.
 
-`"stack-protector-gs-buffer"`
-:   This attribute replaces the heuristic used by the `ssp` and `sspstrong`
-    attributes with the one MSVC's `/GS` (Buffer Security Check) option
-    uses. It has no effect on a function that also has `sspreq`. It takes a
-    boolean value, and is emitted by clang-cl.
-
-    Under this heuristic a function is protected if it takes no variable
-    argument list and it allocates a "GS buffer", which is either an `alloca`
-    with a non-constant or non-one element count, or an alloca that the
-    frontend marked with non-zero `stack-protector` metadata. Whether a given
-    variable is a GS buffer depends on its source-level type, which lowering
-    to IR does not preserve, so classifying the fixed-size allocations is the
-    frontend's job.
-
-    Unlike `sspstrong`, a local variable merely having its address taken does
-    not cause a function to be protected, and no alloca is classified from its
-    IR type. Stack layout rules are unchanged.
-
-    If a function with an `ssp` or `sspstrong` attribute but no
-    `"stack-protector-gs-buffer"` attribute is inlined into a calling function
-    that has one, the attribute is dropped from the caller, so that inlining
-    cannot weaken the callee's protection.
-
 (strictfp)=
 
 `strictfp`
@@ -9211,10 +9188,9 @@ call ptr @malloc(i64 64), !alloc_token !0
 #### '`stack-protector`' Metadata
 
 The `stack-protector` metadata may be attached to alloca instructions.  It
-overrides, for that one allocation, the heuristic that the `ssp`, `sspstrong`
-and `"stack-protector-gs-buffer"` function attributes would otherwise apply.
-The function may still use a stack protector, if other criteria determine it
-needs one.
+overrides, for that one allocation, the heuristic that the `ssp` and
+`sspstrong` function attributes would otherwise apply. The function may still
+use a stack protector, if other criteria determine it needs one.
 
 The metadata contains a single integer:
 
@@ -9223,10 +9199,19 @@ The metadata contains a single integer:
   that is laid out like a small (`< ssp-buffer-size`) array.
 - `2` marks the given alloca as a buffer that requires a stack protector, and
   that is laid out like a large (`>= ssp-buffer-size`) array.
+- `3` opts the given alloca out of requiring a stack protector, because the
+  frontend's heuristic found that it does not need one (as opposed to `0`,
+  which a user asked for explicitly).
+
+Other values are reserved and treated like `2`.
 
 The non-zero values let a frontend classify an allocation itself, which is
 necessary when the decision depends on source-level information that lowering
 to IR does not preserve.
+
+An alloca without this metadata is classified by the function's heuristic, so
+dropping the metadata is always correct, though it may change which functions
+are protected and how their stack is laid out.
 
 ```
  %a = alloca [1000 x i8], align 1, !stack-protector !0
